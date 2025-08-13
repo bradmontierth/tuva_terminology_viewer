@@ -8,26 +8,23 @@ export default function CSVViewer() {
   const [headers, setHeaders] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [currentUrl, setCurrentUrl] = useState('https://tuva-public-resources.s3.amazonaws.com/versioned_terminology/0.14.12/admit_source.csv_0_0_0.csv.gz');
+  const [currentFileName, setCurrentFileName] = useState('admit_source.csv_0_0_0.csv.gz');
   const [terminologyFiles, setTerminologyFiles] = useState([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterTerm, setFilterTerm] = useState('');
   const [pageSize, setPageSize] = useState(100);
   const [currentPage, setCurrentPage] = useState(1);
   const [isPartialData, setIsPartialData] = useState(false);
-  const [terminologyVersion, setTerminologyVersion] = useState('0.14.12');
-  
+  const [terminologyVersion, setTerminologyVersion] = useState('0.14.18');
+
   const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';
   const default_folder = 'versioned_terminology';
   const provider_folder = 'versioned_provider_data';
 
-  // Determine the appropriate folder based on the file name
-  const getBaseUrl = (filename) => {
-    if (filename.includes('provider')) {
-      return baseDomain + '/' + provider_folder + '/' + terminologyVersion + '/';
-    } else {
-      return baseDomain + '/' + default_folder + '/' + terminologyVersion + '/';
-    }
+  // Generate the current URL based on filename and version
+  const getCurrentUrl = () => {
+    const folder = currentFileName.includes('provider') ? provider_folder : default_folder;
+    return `${baseDomain}/${folder}/${terminologyVersion}/${currentFileName}`;
   };
 
   // List of all terminology files
@@ -52,7 +49,6 @@ export default function CSVViewer() {
     'loinc.csv_0_0_0.csv.gz',
     'loinc_deprecated_mapping.csv_0_0_0.csv.gz',
     'mdc.csv_0_0_0.csv.gz',
-    'gender.csv_0_0_0.csv.gz',
     'medicare_dual_eligibility.csv_0_0_0.csv.gz',
     'medicare_orec.csv_0_0_0.csv.gz',
     'medicare_status.csv_0_0_0.csv.gz',
@@ -84,10 +80,10 @@ export default function CSVViewer() {
     if (!csvString.trim()) {
       throw new Error("CSV file is empty");
     }
-    
+
     // Determine if we should limit rows based on file size or if it's partial data
     const shouldLimitRows = isPartial || forceLimit || csvString.length > 2000000; // 2MB threshold
-    
+
     Papa.parse(csvString, {
       header: false,
       dynamicTyping: false, // Disable dynamic typing to preserve string values
@@ -96,11 +92,11 @@ export default function CSVViewer() {
       complete: (results) => {
         if (results.data && results.data.length > 0) {
           setCsvData(results.data);
-          
+
           // Determine if this is actually partial data
           const actuallyPartial = isPartial || (shouldLimitRows && results.meta.truncated);
           setIsPartialData(actuallyPartial);
-          
+
           // Generate column placeholders based on the number of columns in the first row
           if (results.data[0] && Array.isArray(results.data[0])) {
             const columnCount = results.data[0].length;
@@ -126,35 +122,35 @@ export default function CSVViewer() {
     setError(null);
     try {
       const response = await fetch(url);
-      
+
       if (!response.ok) {
-        throw new Error(`Failed to fetch data: ${response.status} ${response.statusText} (${currentUrl})`);
+        throw new Error(`Failed to fetch data: ${response.status} ${response.statusText} (${url})`);
       }
-      
+
       // Get the data as ArrayBuffer
       const arrayBuffer = await response.arrayBuffer();
       const fileSizeBytes = arrayBuffer.byteLength;
-      
+
       // First try to decompress assuming it's gzipped
       try {
         const decompressed = pako.inflate(new Uint8Array(arrayBuffer));
         const decoder = new TextDecoder('utf-8');
         const csvString = decoder.decode(decompressed);
-        
+
         // Check if we should limit parsing due to large decompressed size
         const shouldLimit = csvString.length > 5000000; // 5MB of text
-        
+
         // Process the decompressed CSV
         processCsvString(csvString, false, shouldLimit);
-        
+
       } catch (decompressionError) {
         console.log("Decompression failed, trying to read as plain text CSV", decompressionError);
-        
+
         // If decompression fails, try to read as plain text CSV
         try {
           const decoder = new TextDecoder('utf-8');
           const csvString = decoder.decode(arrayBuffer);
-          
+
           // Check if it looks like a CSV (has commas or typical CSV structure)
           if (csvString.includes(',') || csvString.includes('\n')) {
             // For uncompressed files, check if we should limit based on size
@@ -163,20 +159,20 @@ export default function CSVViewer() {
           } else {
             throw new Error("File doesn't appear to be a valid CSV or compressed CSV");
           }
-          
+
         } catch (textReadError) {
           console.error("Failed to read as plain text CSV", textReadError);
           // If both decompression and plain text reading fail, try partial fetch
           await fetchPartialCSV(url);
         }
       }
-      
+
     } catch (err) {
       setError(`Error: ${err.message}`);
       setLoading(false);
     }
   };
-  
+
   // Function to fetch just a portion of a large file
   const fetchPartialCSV = async (url) => {
     try {
@@ -186,68 +182,68 @@ export default function CSVViewer() {
           'Range': 'bytes=0-150000' // Get first 150KB which should be enough for headers and some rows
         }
       });
-      
+
       if (!response.ok && response.status !== 206) {
         throw new Error(`Failed to fetch partial data: ${response.status} ${response.statusText}`);
       }
-      
+
       // Get the data as ArrayBuffer
       const arrayBuffer = await response.arrayBuffer();
-      
+
       // Try decompression first
       try {
         const decompressed = pako.inflate(new Uint8Array(arrayBuffer));
         const decoder = new TextDecoder('utf-8');
         const csvString = decoder.decode(decompressed);
-        
+
         processCsvString(csvString, true);
-        
+
       } catch (decompressionError) {
         console.log("Partial decompression failed, trying as plain text", decompressionError);
-        
+
         // If decompression fails, try as plain text
         try {
           const decoder = new TextDecoder('utf-8');
           const csvString = decoder.decode(arrayBuffer);
-          
+
           if (csvString.includes(',') || csvString.includes('\n')) {
             processCsvString(csvString, true);
           } else {
             throw new Error("Partial file doesn't appear to be valid CSV");
           }
-          
+
         } catch (textReadError) {
           setError(`Unable to process this file format: ${textReadError.message}`);
           setLoading(false);
         }
       }
-      
+
     } catch (err) {
       setError(`Error fetching partial data: ${err.message}`);
       setLoading(false);
     }
   };
 
+  // This effect will trigger whenever terminologyVersion or currentFileName changes
   useEffect(() => {
-    fetchAndProcessCSV(currentUrl);
+    const url = getCurrentUrl();
+    fetchAndProcessCSV(url);
     // Reset pagination when URL changes
     setCurrentPage(1);
-  }, [currentUrl, terminologyVersion]);
+  }, [currentFileName, terminologyVersion]);
 
   const handleFileSelect = (filename) => {
-    // Use the appropriate base URL based on the filename
-    const baseUrl = getBaseUrl(filename);
-    setCurrentUrl(`${baseUrl}${filename}`);
+    setCurrentFileName(filename);
   };
 
-  const filteredFiles = terminologyFiles.filter(file => 
+  const handleVersionChange = (version) => {
+    setTerminologyVersion(version);
+    // The useEffect will automatically trigger and reload the current file with the new version
+  };
+
+  const filteredFiles = terminologyFiles.filter(file =>
     file.toLowerCase().includes(searchTerm.toLowerCase())
   );
-
-  const getCurrentFileName = () => {
-    const parts = currentUrl.split('/');
-    return parts[parts.length - 1];
-  };
 
   return (
     <div style={{
@@ -273,7 +269,7 @@ export default function CSVViewer() {
           fontWeight: 'bold',
           margin: 0
         }}>Tuva Terminology Viewer</h1>
-        
+
         <div style={{
           display: 'flex',
           alignItems: 'center',
@@ -283,71 +279,53 @@ export default function CSVViewer() {
         }}>
           <span style={{ marginRight: '8px', fontSize: '14px', fontWeight: 500 }}>Version:</span>
           <button
-            onClick={() => {
-              setTerminologyVersion('0.14.9');
-              // Update the current URL with the new version
-              const fileName = getCurrentFileName();
-              const baseUrl = getBaseUrl(fileName);
-              setCurrentUrl(`${baseUrl}${fileName}`);
-            }}
+            onClick={() => handleVersionChange('0.14.16')}
             style={{
               padding: '6px 12px',
               borderRadius: '6px',
               border: 'none',
-              backgroundColor: terminologyVersion === '0.14.9' ? '#3b82f6' : 'transparent',
-              color: terminologyVersion === '0.14.9' ? 'white' : '#6b7280',
+              backgroundColor: terminologyVersion === '0.14.16' ? '#3b82f6' : 'transparent',
+              color: terminologyVersion === '0.14.16' ? 'white' : '#6b7280',
               fontSize: '14px',
               fontWeight: 500,
               cursor: 'pointer'
             }}
           >
-            0.14.9
+            0.14.16
           </button>
           <button
-            onClick={() => {
-              setTerminologyVersion('0.14.11');
-              // Update the current URL with the new version
-              const fileName = getCurrentFileName();
-              const baseUrl = getBaseUrl(fileName);
-              setCurrentUrl(`${baseUrl}${fileName}`);
-            }}
+            onClick={() => handleVersionChange('0.14.17')}
             style={{
               padding: '6px 12px',
               borderRadius: '6px',
               border: 'none',
-              backgroundColor: terminologyVersion === '0.14.11' ? '#3b82f6' : 'transparent',
-              color: terminologyVersion === '0.14.11' ? 'white' : '#6b7280',
+              backgroundColor: terminologyVersion === '0.14.17' ? '#3b82f6' : 'transparent',
+              color: terminologyVersion === '0.14.17' ? 'white' : '#6b7280',
               fontSize: '14px',
               fontWeight: 500,
               cursor: 'pointer'
             }}
           >
-            0.14.11
+            0.14.17
           </button>
           <button
-            onClick={() => {
-              setTerminologyVersion('0.14.12');
-              // Update the current URL with the new version
-              const fileName = getCurrentFileName();
-              const baseUrl = getBaseUrl(fileName);
-              setCurrentUrl(`${baseUrl}${fileName}`);
-            }}
+            onClick={() => handleVersionChange('0.14.18')}
             style={{
               padding: '6px 12px',
               borderRadius: '6px',
               border: 'none',
-              backgroundColor: terminologyVersion === '0.14.12' ? '#3b82f6' : 'transparent',
-              color: terminologyVersion === '0.14.12' ? 'white' : '#6b7280',
+              backgroundColor: terminologyVersion === '0.14.18' ? '#3b82f6' : 'transparent',
+              color: terminologyVersion === '0.14.18' ? 'white' : '#6b7280',
               fontSize: '14px',
               fontWeight: 500,
               cursor: 'pointer'
             }}
           >
-            0.14.12
+            0.14.18
           </button>
         </div>
       </div>
-      
+
       {/* Left sidebar with file list */}
       <div style={{
         width: '25%',
@@ -368,7 +346,7 @@ export default function CSVViewer() {
           fontWeight: 600,
           marginBottom: '12px'
         }}>Available Files - Version {terminologyVersion}</h2>
-        
+
         <div style={{
           position: 'relative',
           marginBottom: '16px'
@@ -396,14 +374,14 @@ export default function CSVViewer() {
             height: '16px'
           }} />
         </div>
-        
+
         <div style={{
           overflowY: 'auto',
           flexGrow: 1
         }}>
           {filteredFiles.map((file, index) => (
-            <div 
-              key={index} 
+            <div
+              key={index}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -411,7 +389,7 @@ export default function CSVViewer() {
                 cursor: 'pointer',
                 borderRadius: '6px',
                 marginBottom: '2px',
-                backgroundColor: getCurrentFileName() === file ? '#dbeafe' : 'transparent'
+                backgroundColor: currentFileName === file ? '#dbeafe' : 'transparent'
               }}
               onClick={() => handleFileSelect(file)}
             >
@@ -431,7 +409,7 @@ export default function CSVViewer() {
           ))}
         </div>
       </div>
-      
+
       {/* Right side with file content */}
       <div style={{
         width: '75%',
@@ -457,7 +435,7 @@ export default function CSVViewer() {
               fontWeight: 600,
               margin: 0
             }}>
-              {getCurrentFileName()}
+              {currentFileName}
             </h2>
           {!loading && !error && (
               <p style={{
@@ -466,15 +444,15 @@ export default function CSVViewer() {
                 marginTop: '4px',
                 marginBottom: 0
               }}>
-                {isPartialData 
-                  ? `Partial load: ${csvData.length} rows` 
+                {isPartialData
+                  ? `Partial load: ${csvData.length} rows`
                   : `Total rows: ${csvData.length}`}
-                  , Url: {currentUrl}
+                  , Url: {getCurrentUrl()}
               </p>
             )}
           </div>
-          <a 
-            href={currentUrl}
+          <a
+            href={getCurrentUrl()}
             download
             style={{
               display: 'flex',
