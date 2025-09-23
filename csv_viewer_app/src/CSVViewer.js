@@ -2,6 +2,46 @@ import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Search, Download, FileText, Loader2 } from 'lucide-react';
 import * as Papa from 'papaparse';
 import pako from 'pako';
+import JSZip from 'jszip';
+
+const CSV_TEXT_LIMIT = 5000000; // 5MB of text before limiting rows
+
+const isZipFileName = (fileName = '') => fileName.toLowerCase().endsWith('.zip');
+
+const hasZipSignature = (arrayBuffer) => {
+  const bytes = new Uint8Array(arrayBuffer.slice(0, 4));
+  if (bytes.length < 4) {
+    return false;
+  }
+  const matchesPK = bytes[0] === 0x50 && bytes[1] === 0x4b;
+  if (!matchesPK) {
+    return false;
+  }
+  return [0x03, 0x05, 0x07].includes(bytes[2]) && [0x04, 0x06, 0x08].includes(bytes[3]);
+};
+
+const extractCsvFromZip = async (arrayBuffer, preferredName = '') => {
+  const zip = await JSZip.loadAsync(arrayBuffer);
+  const entries = Object.values(zip.files).filter((entry) => !entry.dir);
+
+  if (!entries.length) {
+    throw new Error('ZIP archive has no files');
+  }
+
+  const csvEntries = entries.filter((entry) => entry.name.toLowerCase().endsWith('.csv'));
+  if (!csvEntries.length) {
+    throw new Error('ZIP archive does not contain CSV files');
+  }
+
+  const preferredBase = preferredName.replace(/\.zip$/i, '').toLowerCase();
+  const matchedEntry = preferredBase
+    ? csvEntries.find((entry) => entry.name.toLowerCase().includes(preferredBase))
+    : null;
+
+  const targetEntry = matchedEntry || csvEntries[0];
+  const csvString = await targetEntry.async('string');
+  return { csvString, entryName: targetEntry.name };
+};
 
 export default function CSVViewer() {
   const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';
@@ -33,7 +73,11 @@ export default function CSVViewer() {
       label: 'Reference Data',
       versionLabel: null,
       sources: [
-        { folder: reference_data_folder, type: 'unversioned' }
+        {
+          folder: reference_data_folder,
+          type: 'unversioned',
+          excludedPrefixes: [`${reference_data_folder}/2022 Census Shapefiles/`]
+        }
       ]
     }
   ]), [default_folder, provider_folder, value_sets_folder, reference_data_folder]);
@@ -514,6 +558,7 @@ export default function CSVViewer() {
       const files = [];
       let continuationToken = null;
       const isVersioned = source.type === 'versioned';
+      const excludedPrefixes = Array.isArray(source.excludedPrefixes) ? source.excludedPrefixes : [];
       const prefixBase = isVersioned
         ? `${source.folder}/${terminologyVersion}/`
         : `${source.folder}/`;
@@ -585,6 +630,9 @@ export default function CSVViewer() {
           const keyNode = getElementsByTag(node, 'Key')[0];
           const keyText = keyNode?.textContent || '';
           if (!keyText || keyText.endsWith('/')) {
+            return;
+          }
+          if (excludedPrefixes.some((prefix) => keyText.startsWith(prefix))) {
             return;
           }
           let relative = keyText;
@@ -759,7 +807,7 @@ export default function CSVViewer() {
     }
   }, [processCsvString]);
 
-  const fetchAndProcessCSV = useCallback(async (url) => {
+  const fetchAndProcessCSV = useCallback(async (url, fileName = '') => {
     setLoading(true);
     setError(null);
     try {
@@ -773,6 +821,20 @@ export default function CSVViewer() {
       const arrayBuffer = await response.arrayBuffer();
       const fileSizeBytes = arrayBuffer.byteLength;
 
+      const zipLikely = isZipFileName(fileName) || hasZipSignature(arrayBuffer);
+      if (zipLikely) {
+        try {
+          const { csvString } = await extractCsvFromZip(arrayBuffer, fileName);
+          const shouldLimit = csvString.length > CSV_TEXT_LIMIT; // 5MB of text
+          processCsvString(csvString, false, shouldLimit);
+          return;
+        } catch (zipError) {
+          setError(`Unable to extract ZIP archive: ${zipError.message}`);
+          setLoading(false);
+          return;
+        }
+      }
+
       // First try to decompress assuming it's gzipped
       try {
         const decompressed = pako.inflate(new Uint8Array(arrayBuffer));
@@ -780,7 +842,7 @@ export default function CSVViewer() {
         const csvString = decoder.decode(decompressed);
 
         // Check if we should limit parsing due to large decompressed size
-        const shouldLimit = csvString.length > 5000000; // 5MB of text
+        const shouldLimit = csvString.length > CSV_TEXT_LIMIT; // 5MB of text
 
         // Process the decompressed CSV
         processCsvString(csvString, false, shouldLimit);
@@ -796,7 +858,7 @@ export default function CSVViewer() {
           // Check if it looks like a CSV (has commas or typical CSV structure)
           if (csvString.includes(',') || csvString.includes('\n')) {
             // For uncompressed files, check if we should limit based on size
-            const shouldLimit = fileSizeBytes > 5000000; // 5MB file size
+            const shouldLimit = fileSizeBytes > CSV_TEXT_LIMIT; // 5MB file size
             processCsvString(csvString, false, shouldLimit);
           } else {
             throw new Error("File doesn't appear to be a valid CSV or compressed CSV");
@@ -822,10 +884,10 @@ export default function CSVViewer() {
     if (!currentFileUrl) {
       return;
     }
-    fetchAndProcessCSV(currentFileUrl);
+    fetchAndProcessCSV(currentFileUrl, currentFileName || '');
     // Reset pagination when URL changes
     setCurrentPage(1);
-  }, [currentFileUrl, fetchAndProcessCSV]);
+  }, [currentFileUrl, currentFileName, fetchAndProcessCSV]);
 
   const handleGroupSelect = (groupId) => {
     const group = fileGroups.find((item) => item.id === groupId);

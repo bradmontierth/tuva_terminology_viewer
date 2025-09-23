@@ -1,5 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import JSZip from 'jszip';
 import CSVViewer from './CSVViewer';
 
 describe('CSVViewer version loading', () => {
@@ -63,11 +64,18 @@ describe('CSVViewer version loading', () => {
     <Name>tuva-public-resources</Name>
     <Prefix>reference-data/</Prefix>
     <IsTruncated>false</IsTruncated>
-    <Contents><Key>reference-data/reference.csv.gz</Key></Contents>
+    <Contents><Key>reference-data/reference.zip</Key></Contents>
+    <Contents><Key>reference-data/2022 Census Shapefiles/shapes.zip</Key></Contents>
   </ListBucketResult>`;
 
-  beforeEach(() => {
+  let referenceZipBuffer;
+
+  beforeEach(async () => {
     const csvBuffer = Uint8Array.from(Buffer.from('col1,col2\n1,2', 'utf-8')).buffer;
+
+    const zip = new JSZip();
+    zip.file('reference.csv', 'col1,col2\n3,4');
+    referenceZipBuffer = await zip.generateAsync({ type: 'uint8array' });
 
     if (typeof TextDecoder === 'undefined') {
       global.TextDecoder = require('util').TextDecoder;
@@ -114,8 +122,8 @@ describe('CSVViewer version loading', () => {
         return new Response(csvBuffer, { status: 200 });
       }
 
-      if (url.includes('reference-data/reference.csv.gz')) {
-        return new Response(csvBuffer, { status: 200 });
+      if (url.includes('reference-data/reference.zip')) {
+        return new Response(referenceZipBuffer, { status: 200 });
       }
 
       return new Response('', { status: 404 });
@@ -187,9 +195,11 @@ describe('CSVViewer version loading', () => {
 
     await waitFor(() => expect(screen.queryByLabelText(/version/i)).toBeNull());
     expect(await screen.findByText('Available Files')).toBeInTheDocument();
-    expect(await screen.findByRole('button', { name: 'reference.csv.gz' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /reference\.zip/i })).toBeInTheDocument();
+    expect(await screen.findByText('col1')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /shapes\.zip/i })).not.toBeInTheDocument();
 
     const downloadLink = await screen.findByRole('link', { name: /download/i });
-    expect(downloadLink).toHaveAttribute('href', expect.stringContaining('reference-data/reference.csv.gz'));
+    expect(downloadLink).toHaveAttribute('href', expect.stringContaining('reference-data/reference.zip'));
   });
 });
