@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Search, Download, FileText, Loader2 } from 'lucide-react';
 import * as Papa from 'papaparse';
 import pako from 'pako';
@@ -15,16 +15,23 @@ export default function CSVViewer() {
   const [pageSize, setPageSize] = useState(100);
   const [currentPage, setCurrentPage] = useState(1);
   const [isPartialData, setIsPartialData] = useState(false);
-  const [terminologyVersion, setTerminologyVersion] = useState('0.14.18');
+  const [terminologyVersion, setTerminologyVersion] = useState(null);
+  const [terminologyVersions, setTerminologyVersions] = useState([]);
+  const [isLoadingVersions, setIsLoadingVersions] = useState(false);
+  const [versionLoadError, setVersionLoadError] = useState(null);
+  const userSelectedVersionRef = useRef(false);
 
   const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';
   const default_folder = 'versioned_terminology';
   const provider_folder = 'versioned_provider_data';
 
   // Generate the current URL based on filename and version
-  const getCurrentUrl = () => {
+  const getCurrentUrl = (version = terminologyVersion) => {
+    if (!version) {
+      return '';
+    }
     const folder = currentFileName.includes('provider') ? provider_folder : default_folder;
-    return `${baseDomain}/${folder}/${terminologyVersion}/${currentFileName}`;
+    return `${baseDomain}/${folder}/${version}/${currentFileName}`;
   };
 
   // List of all terminology files
@@ -73,6 +80,276 @@ export default function CSVViewer() {
   // Initialize terminology files
   useEffect(() => {
     setTerminologyFiles(terminology_file_list);
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const determineListingBase = () => {
+      if (typeof window === 'undefined') {
+        return baseDomain;
+      }
+
+      const shouldUseProxy = typeof process !== 'undefined'
+        && process.env?.REACT_APP_USE_S3_PROXY === 'true';
+
+      if (!shouldUseProxy) {
+        return baseDomain;
+      }
+
+      const hostname = window.location.hostname;
+      const isLocalHost = [
+        'localhost',
+        '127.0.0.1',
+        '::1',
+        '0.0.0.0'
+      ].includes(hostname);
+
+      return isLocalHost ? '/s3-proxy' : baseDomain;
+    };
+
+    let listingBase = determineListingBase();
+
+    const buildListingUrl = (folder, params, base = listingBase) => {
+      if (base === '/s3-proxy') {
+        return `${base}/?${params}`;
+      }
+
+      const baseUrl = `${base.replace(/\/$/, '')}/`;
+      const url = new URL(baseUrl);
+      url.search = params;
+      return url.toString();
+    };
+
+    const getElementsByTag = (context, tag) => {
+      if (!context) {
+        return [];
+      }
+
+      const directMatches = typeof context.getElementsByTagName === 'function'
+        ? Array.from(context.getElementsByTagName(tag))
+        : [];
+
+      if (directMatches.length) {
+        return directMatches;
+      }
+
+      const namespaceLookup = typeof context.lookupNamespaceURI === 'function'
+        ? context.lookupNamespaceURI(null)
+        : undefined;
+
+      if (typeof context.getElementsByTagNameNS === 'function') {
+        const namespace = namespaceLookup || context.documentElement?.namespaceURI || context.namespaceURI || '*';
+        const nsMatches = Array.from(context.getElementsByTagNameNS(namespace, tag));
+        if (nsMatches.length) {
+          return nsMatches;
+        }
+
+        const wildcardMatches = namespace !== '*'
+          ? Array.from(context.getElementsByTagNameNS('*', tag))
+          : [];
+        if (wildcardMatches.length) {
+          return wildcardMatches;
+        }
+      }
+
+      if (typeof tag === 'string') {
+        const loweredTag = tag.toLowerCase();
+        if (loweredTag !== tag && typeof context.getElementsByTagName === 'function') {
+          const lowerMatches = Array.from(context.getElementsByTagName(loweredTag));
+          if (lowerMatches.length) {
+            return lowerMatches;
+          }
+        }
+      }
+
+      return [];
+    };
+
+    const extractVersionsFromDocument = (xmlDocument, folder) => {
+      const decodeValue = (value) => {
+        try {
+          return decodeURIComponent(value);
+        } catch (err) {
+          return value;
+        }
+      };
+
+      const normalizePrefix = (rawPrefix) => {
+        const prefix = decodeValue(rawPrefix || '');
+        return prefix
+          .replace(`${folder}/`, '')
+          .replace(/\/+$/, '')
+          .trim();
+      };
+
+      const commonPrefixNodes = getElementsByTag(xmlDocument, 'CommonPrefixes');
+      const fromCommonPrefixes = commonPrefixNodes.reduce((acc, group) => {
+        getElementsByTag(group, 'Prefix')
+          .map((node) => normalizePrefix(node.textContent || ''))
+          .filter(Boolean)
+          .forEach((value) => acc.push(value));
+        return acc;
+      }, []);
+
+      if (fromCommonPrefixes.length) {
+        return fromCommonPrefixes;
+      }
+
+      const keyNodes = getElementsByTag(xmlDocument, 'Key');
+      const fromKeys = keyNodes
+        .map((node) => normalizePrefix(node.textContent || ''))
+        .map((value) => value.split('/')[0] || '')
+        .filter(Boolean);
+
+      return fromKeys;
+    };
+
+    const fetchVersionsForFolder = async (folder) => {
+      const versions = [];
+      let continuationToken = null;
+
+      do {
+        const params = new URLSearchParams({
+          'list-type': '2',
+          prefix: `${folder}/`,
+          delimiter: '/',
+        });
+
+        if (continuationToken) {
+          params.append('continuation-token', continuationToken);
+        }
+
+        const url = buildListingUrl(folder, params.toString());
+        const requestOptions = {
+          cache: 'no-store',
+          headers: {
+            Accept: 'application/xml,text/xml;q=0.9',
+          },
+        };
+
+        let response = await fetch(url, requestOptions);
+
+        if (response.status === 304) {
+          response = await fetch(url, { ...requestOptions, cache: 'reload' });
+        }
+
+        if (!response.ok) {
+          throw new Error(`Failed to list versions for ${folder}: ${response.status} ${response.statusText}`);
+        }
+
+        if (typeof DOMParser === 'undefined') {
+          throw new Error('DOMParser is not available in this environment.');
+        }
+
+        const xmlText = await response.text();
+
+        if (!xmlText.trim()) {
+          throw new Error('Received empty version listing response.');
+        }
+
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('xml') && /^\s*<!doctype\s+html/i.test(xmlText)) {
+          if (listingBase !== baseDomain) {
+            listingBase = baseDomain;
+            continue;
+          }
+          throw new Error('Received HTML instead of XML when listing versions.');
+        }
+
+        const parser = new DOMParser();
+        const xmlDocument = parser.parseFromString(xmlText, 'application/xml');
+
+        const hasParseError = (
+          xmlDocument.querySelector?.('parsererror') ||
+          xmlDocument.querySelector?.('ParserError') ||
+          getElementsByTag(xmlDocument, 'parsererror')[0] ||
+          getElementsByTag(xmlDocument, 'ParserError')[0]
+        );
+
+        if (hasParseError) {
+          throw new Error('Unable to parse version listing response.');
+        }
+
+        const errorNode = getElementsByTag(xmlDocument, 'Error')[0];
+        if (errorNode) {
+          const code = getElementsByTag(errorNode, 'Code')[0]?.textContent || 'UnknownCode';
+          const message = getElementsByTag(errorNode, 'Message')[0]?.textContent || 'Unknown error';
+          throw new Error(`S3 error while listing ${folder}: ${code} - ${message}`);
+        }
+
+        const pageVersions = extractVersionsFromDocument(xmlDocument, folder);
+        versions.push(...pageVersions);
+
+        const isTruncated = getElementsByTag(xmlDocument, 'IsTruncated')[0]?.textContent === 'true';
+        continuationToken = isTruncated
+          ? getElementsByTag(xmlDocument, 'NextContinuationToken')[0]?.textContent || null
+          : null;
+      } while (continuationToken);
+
+      return versions;
+    };
+
+    const loadAvailableVersions = async () => {
+      setIsLoadingVersions(true);
+      setVersionLoadError(null);
+
+      try {
+        const [terminologyList, providerList] = await Promise.all([
+          fetchVersionsForFolder(default_folder),
+          fetchVersionsForFolder(provider_folder)
+        ]);
+
+        if (!isMounted) {
+          return;
+        }
+
+        const uniqueVersions = Array.from(new Set([...terminologyList, ...providerList])).filter(Boolean);
+
+        const normalizeForSort = (value) => value.replace(/_/g, '.');
+        const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+        const latestLabel = 'latest';
+        const withoutLatest = uniqueVersions.filter((version) => version.toLowerCase() !== latestLabel);
+        if (withoutLatest.length > 1) {
+          withoutLatest.sort((a, b) => collator.compare(normalizeForSort(b), normalizeForSort(a)));
+        }
+
+        const hasLatest = uniqueVersions.some((version) => version.toLowerCase() === latestLabel);
+        const orderedVersions = hasLatest ? [...withoutLatest, latestLabel] : withoutLatest;
+
+        setTerminologyVersions(orderedVersions);
+
+        if (orderedVersions.length) {
+          setTerminologyVersion((current) => {
+            if (!userSelectedVersionRef.current) {
+              return orderedVersions[0];
+            }
+
+            if (current && orderedVersions.includes(current)) {
+              return current;
+            }
+
+            return orderedVersions[0];
+          });
+        }
+      } catch (err) {
+        console.error('Failed to load terminology versions from S3', err);
+        if (isMounted) {
+          setVersionLoadError('Unable to load versions from S3. Displaying latest available version.');
+        }
+      } finally {
+        if (isMounted) {
+          setIsLoadingVersions(false);
+        }
+      }
+    };
+
+    loadAvailableVersions();
+
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   // Helper function to process CSV string and update state
@@ -227,6 +504,9 @@ export default function CSVViewer() {
   // This effect will trigger whenever terminologyVersion or currentFileName changes
   useEffect(() => {
     const url = getCurrentUrl();
+    if (!url) {
+      return;
+    }
     fetchAndProcessCSV(url);
     // Reset pagination when URL changes
     setCurrentPage(1);
@@ -237,6 +517,10 @@ export default function CSVViewer() {
   };
 
   const handleVersionChange = (version) => {
+    if (!version) {
+      return;
+    }
+    userSelectedVersionRef.current = true;
     setTerminologyVersion(version);
     // The useEffect will automatically trigger and reload the current file with the new version
   };
@@ -244,6 +528,12 @@ export default function CSVViewer() {
   const filteredFiles = terminologyFiles.filter(file =>
     file.toLowerCase().includes(searchTerm.toLowerCase())
   );
+
+  const availableVersions = terminologyVersions.length
+    ? terminologyVersions
+    : (terminologyVersion ? [terminologyVersion] : []);
+
+  const currentFileUrl = getCurrentUrl();
 
   return (
     <div style={{
@@ -272,57 +562,57 @@ export default function CSVViewer() {
 
         <div style={{
           display: 'flex',
-          alignItems: 'center',
-          backgroundColor: '#f3f4f6',
-          borderRadius: '8px',
-          padding: '4px'
+          flexDirection: 'column',
+          alignItems: 'flex-end',
+          maxWidth: '100%'
         }}>
-          <span style={{ marginRight: '8px', fontSize: '14px', fontWeight: 500 }}>Version:</span>
-          <button
-            onClick={() => handleVersionChange('0.14.16')}
+          <label htmlFor="terminology-version" style={{
+            fontSize: '12px',
+            fontWeight: 600,
+            color: '#4b5563',
+            marginBottom: '4px'
+          }}>
+            Terminology version
+          </label>
+          <select
+            id="terminology-version"
+            value={terminologyVersion ?? ''}
+            onChange={(event) => handleVersionChange(event.target.value)}
+            disabled={isLoadingVersions || !availableVersions.length}
             style={{
-              padding: '6px 12px',
-              borderRadius: '6px',
-              border: 'none',
-              backgroundColor: terminologyVersion === '0.14.16' ? '#3b82f6' : 'transparent',
-              color: terminologyVersion === '0.14.16' ? 'white' : '#6b7280',
+              minWidth: '200px',
+              padding: '8px 12px',
+              borderRadius: '8px',
+              border: '1px solid #d1d5db',
               fontSize: '14px',
               fontWeight: 500,
-              cursor: 'pointer'
+              color: '#111827',
+              backgroundColor: isLoadingVersions ? '#f9fafb' : 'white'
             }}
           >
-            0.14.16
-          </button>
-          <button
-            onClick={() => handleVersionChange('0.14.17')}
-            style={{
-              padding: '6px 12px',
-              borderRadius: '6px',
-              border: 'none',
-              backgroundColor: terminologyVersion === '0.14.17' ? '#3b82f6' : 'transparent',
-              color: terminologyVersion === '0.14.17' ? 'white' : '#6b7280',
-              fontSize: '14px',
-              fontWeight: 500,
-              cursor: 'pointer'
-            }}
-          >
-            0.14.17
-          </button>
-          <button
-            onClick={() => handleVersionChange('0.14.18')}
-            style={{
-              padding: '6px 12px',
-              borderRadius: '6px',
-              border: 'none',
-              backgroundColor: terminologyVersion === '0.14.18' ? '#3b82f6' : 'transparent',
-              color: terminologyVersion === '0.14.18' ? 'white' : '#6b7280',
-              fontSize: '14px',
-              fontWeight: 500,
-              cursor: 'pointer'
-            }}
-          >
-            0.14.18
-          </button>
+            {isLoadingVersions ? (
+              <option value="" disabled>Loading versions…</option>
+            ) : (
+              <>
+                {!terminologyVersion && <option value="" disabled>Choose a version</option>}
+                {availableVersions.map((version) => (
+                  <option key={version} value={version}>
+                    {version}
+                  </option>
+                ))}
+              </>
+            )}
+          </select>
+          {!isLoadingVersions && !availableVersions.length && !versionLoadError && (
+            <span style={{ marginTop: '4px', fontSize: '12px', color: '#dc2626' }}>
+              No versions available
+            </span>
+          )}
+          {versionLoadError && (
+            <span style={{ marginTop: '4px', fontSize: '12px', color: '#dc2626' }}>
+              {versionLoadError}
+            </span>
+          )}
         </div>
       </div>
 
@@ -437,7 +727,7 @@ export default function CSVViewer() {
             }}>
               {currentFileName}
             </h2>
-          {!loading && !error && (
+          {!loading && !error && currentFileUrl && (
               <p style={{
                 fontSize: '14px',
                 color: '#6b7280',
@@ -447,12 +737,12 @@ export default function CSVViewer() {
                 {isPartialData
                   ? `Partial load: ${csvData.length} rows`
                   : `Total rows: ${csvData.length}`}
-                  , Url: {getCurrentUrl()}
+                {currentFileUrl ? `, Url: ${currentFileUrl}` : ''}
               </p>
             )}
           </div>
           <a
-            href={getCurrentUrl()}
+            href={currentFileUrl || undefined}
             download
             style={{
               display: 'flex',
@@ -461,6 +751,7 @@ export default function CSVViewer() {
               fontSize: '14px',
               textDecoration: 'none'
             }}
+            aria-disabled={!currentFileUrl}
           >
             <Download style={{
               width: '16px',
