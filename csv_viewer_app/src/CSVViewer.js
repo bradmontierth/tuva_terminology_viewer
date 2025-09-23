@@ -1,79 +1,571 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Search, Download, FileText, Loader2 } from 'lucide-react';
 import * as Papa from 'papaparse';
 import pako from 'pako';
 
 export default function CSVViewer() {
+  const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';
+  const default_folder = 'versioned_terminology';
+  const provider_folder = 'versioned_provider_data';
+
   const [csvData, setCsvData] = useState([]);
   const [headers, setHeaders] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [currentFileName, setCurrentFileName] = useState('admit_source.csv_0_0_0.csv.gz');
-  const [terminologyFiles, setTerminologyFiles] = useState([]);
+  const [currentFileName, setCurrentFileName] = useState(null);
+  const [currentFileFolder, setCurrentFileFolder] = useState(default_folder);
+  const [fileGroups, setFileGroups] = useState([]);
+  const [selectedGroupId, setSelectedGroupId] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterTerm, setFilterTerm] = useState('');
   const [pageSize, setPageSize] = useState(100);
   const [currentPage, setCurrentPage] = useState(1);
   const [isPartialData, setIsPartialData] = useState(false);
-  const [terminologyVersion, setTerminologyVersion] = useState('0.14.18');
+  const [terminologyVersion, setTerminologyVersion] = useState(null);
+  const [terminologyVersions, setTerminologyVersions] = useState([]);
+  const [isLoadingVersions, setIsLoadingVersions] = useState(false);
+  const [versionLoadError, setVersionLoadError] = useState(null);
+  const [isLoadingFiles, setIsLoadingFiles] = useState(false);
+  const [fileLoadError, setFileLoadError] = useState(null);
+  const userSelectedVersionRef = useRef(false);
+  const listingBaseRef = useRef(null);
 
-  const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';
-  const default_folder = 'versioned_terminology';
-  const provider_folder = 'versioned_provider_data';
+  const determineListingBase = () => {
+    if (typeof window === 'undefined') {
+      return baseDomain;
+    }
 
-  // Generate the current URL based on filename and version
-  const getCurrentUrl = () => {
-    const folder = currentFileName.includes('provider') ? provider_folder : default_folder;
-    return `${baseDomain}/${folder}/${terminologyVersion}/${currentFileName}`;
+    const shouldUseProxy = typeof process !== 'undefined'
+      && process.env?.REACT_APP_USE_S3_PROXY === 'true';
+
+    if (!shouldUseProxy) {
+      return baseDomain;
+    }
+
+    const hostname = window.location.hostname;
+    const isLocalHost = [
+      'localhost',
+      '127.0.0.1',
+      '::1',
+      '0.0.0.0'
+    ].includes(hostname);
+
+    return isLocalHost ? '/s3-proxy' : baseDomain;
   };
 
-  // List of all terminology files
-  const terminology_file_list = [
-    'admit_source.csv_0_0_0.csv.gz',
-    'admit_type.csv_0_0_0.csv.gz',
-    'apr_drg.csv_0_0_0.csv.gz',
-    'bill_type.csv_0_0_0.csv.gz',
-    'ccs_services_procedures.csv_0_0_0.csv.gz',
-    'claim_type.csv_0_0_0.csv.gz',
-    'discharge_disposition.csv_0_0_0.csv.gz',
-    'encounter_type.csv_0_0_0.csv.gz',
-    'ethnicity.csv_0_0_0.csv.gz',
-    'gender.csv_0_0_0.csv.gz',
-    'hcpcs_level_2.csv_0_0_0.csv.gz',
-    'hcpcs_to_rbcs.csv_0_0_0.csv.gz',
-    'icd_10_pcs_cms_ontology.csv_0_0_0.csv.gz',
-    'icd_10_cm.csv_0_0_0.csv.gz',
-    'icd_10_pcs.csv_0_0_0.csv.gz',
-    'icd_9_cm.csv_0_0_0.csv.gz',
-    'icd_9_pcs.csv_0_0_0.csv.gz',
-    'loinc.csv_0_0_0.csv.gz',
-    'loinc_deprecated_mapping.csv_0_0_0.csv.gz',
-    'mdc.csv_0_0_0.csv.gz',
-    'medicare_dual_eligibility.csv_0_0_0.csv.gz',
-    'medicare_orec.csv_0_0_0.csv.gz',
-    'medicare_status.csv_0_0_0.csv.gz',
-    'ms_drg.csv_0_0_0.csv.gz',
-    'ms_drg_weights_los.csv_0_0_0.csv.gz',
-    'ndc.csv_0_0_0.csv.gz',
-    'nitos.csv_0_0_0.csv.gz',
-    'other_provider_taxonomy.csv_0_0_0.csv.gz',
-    'payer_type.csv_0_0_0.csv.gz',
-    'place_of_service.csv_0_0_0.csv.gz',
-    'present_on_admission.csv_0_0_0.csv.gz',
-    'provider.csv_0_0_0.csv.gz',
-    'race.csv_0_0_0.csv.gz',
-    'revenue_center.csv_0_0_0.csv.gz',
-    'rxnorm_brand_generic.csv_0_0_0.csv.gz',
-    'rxnorm_to_atc.csv_0_0_0.csv.gz',
-    'snomed_ct.csv_0_0_0.csv.gz',
-    'snomed_ct_transitive_closures.csv_0_0_0.csv.gz',
-    'snomed_icd_10_map.csv_0_0_0.csv.gz',
-  ];
+  const getListingBase = () => {
+    if (!listingBaseRef.current) {
+      listingBaseRef.current = determineListingBase();
+    }
+    return listingBaseRef.current;
+  };
 
-  // Initialize terminology files
+  const setListingBase = (value) => {
+    listingBaseRef.current = value;
+  };
+
+  const buildListingUrl = (folder, params, base = getListingBase()) => {
+    if (base === '/s3-proxy') {
+      return `${base}/?${params}`;
+    }
+
+    const baseUrl = `${base.replace(/\/$/, '')}/`;
+    const url = new URL(baseUrl);
+    url.search = params;
+    return url.toString();
+  };
+
+  const getElementsByTag = (context, tag) => {
+    if (!context) {
+      return [];
+    }
+
+    const directMatches = typeof context.getElementsByTagName === 'function'
+      ? Array.from(context.getElementsByTagName(tag))
+      : [];
+
+    if (directMatches.length) {
+      return directMatches;
+    }
+
+    const namespaceLookup = typeof context.lookupNamespaceURI === 'function'
+      ? context.lookupNamespaceURI(null)
+      : undefined;
+
+    if (typeof context.getElementsByTagNameNS === 'function') {
+      const namespace = namespaceLookup || context.documentElement?.namespaceURI || context.namespaceURI || '*';
+      const nsMatches = Array.from(context.getElementsByTagNameNS(namespace, tag));
+      if (nsMatches.length) {
+        return nsMatches;
+      }
+
+      const wildcardMatches = namespace !== '*'
+        ? Array.from(context.getElementsByTagNameNS('*', tag))
+        : [];
+      if (wildcardMatches.length) {
+        return wildcardMatches;
+      }
+    }
+
+    if (typeof tag === 'string') {
+      const loweredTag = tag.toLowerCase();
+      if (loweredTag !== tag && typeof context.getElementsByTagName === 'function') {
+        const lowerMatches = Array.from(context.getElementsByTagName(loweredTag));
+        if (lowerMatches.length) {
+          return lowerMatches;
+        }
+      }
+    }
+
+    return [];
+  };
+
+  const toBaseCsvName = (fileName = '') => {
+    const normalized = fileName.trim();
+    if (!normalized) {
+      return '';
+    }
+
+    const match = normalized.match(/^(.*?\.csv)(?:_[0-9]+(?:_[0-9]+)*)?\.csv\.gz$/i);
+    if (match) {
+      return match[1];
+    }
+
+    if (normalized.endsWith('.csv.gz')) {
+      return normalized.replace(/\.csv\.gz$/i, '.csv');
+    }
+
+    return normalized;
+  };
+
+  const toFriendlyLabel = (csvName = '') => {
+    const base = csvName.replace(/\.csv$/i, '');
+    if (!base) {
+      return csvName;
+    }
+
+    return base
+      .split(/[_-]+/)
+      .filter(Boolean)
+      .map((word) => {
+        if (/^[a-z0-9]+$/i.test(word) && word.length <= 3) {
+          return word.toUpperCase();
+        }
+        return word.charAt(0).toUpperCase() + word.slice(1);
+      })
+      .join(' ');
+  };
+
+  const createGroupId = (folder, csvName) => `${folder}::${csvName.toLowerCase()}`;
+
+
+  const buildFileGroups = (fileEntries) => {
+    const groups = new Map();
+
+    fileEntries.forEach(({ folder, fileName }) => {
+      const csvName = toBaseCsvName(fileName);
+      const id = createGroupId(folder, csvName);
+
+      if (!groups.has(id)) {
+        groups.set(id, {
+          id,
+          folder,
+          csvName,
+          displayName: toFriendlyLabel(csvName),
+          files: [],
+        });
+      }
+
+      const group = groups.get(id);
+      group.files.push(fileName);
+    });
+
+    const sortedGroups = Array.from(groups.values()).map((group) => ({
+      ...group,
+      files: group.files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true })),
+    }));
+
+    sortedGroups.sort((a, b) => {
+      if (a.folder === b.folder) {
+        return a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' });
+      }
+      if (a.folder === default_folder) {
+        return -1;
+      }
+      if (b.folder === default_folder) {
+        return 1;
+      }
+      return a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' });
+    });
+
+    return sortedGroups;
+  };
+  // Generate the current URL based on filename and version
+  const getCurrentUrl = (version = terminologyVersion, folder = currentFileFolder) => {
+    if (!version || !currentFileName) {
+      return '';
+    }
+    const targetFolder = folder || default_folder;
+    return `${baseDomain}/${targetFolder}/${version}/${currentFileName}`;
+  };
+
   useEffect(() => {
-    setTerminologyFiles(terminology_file_list);
+    let isMounted = true;
+
+    let listingBase = getListingBase();
+
+    const extractVersionsFromDocument = (xmlDocument, folder) => {
+      const decodeValue = (value) => {
+        try {
+          return decodeURIComponent(value);
+        } catch (err) {
+          return value;
+        }
+      };
+
+      const normalizePrefix = (rawPrefix) => {
+        const prefix = decodeValue(rawPrefix || '');
+        return prefix
+          .replace(`${folder}/`, '')
+          .replace(/\/+$/, '')
+          .trim();
+      };
+
+      const commonPrefixNodes = getElementsByTag(xmlDocument, 'CommonPrefixes');
+      const fromCommonPrefixes = commonPrefixNodes.reduce((acc, group) => {
+        getElementsByTag(group, 'Prefix')
+          .map((node) => normalizePrefix(node.textContent || ''))
+          .filter(Boolean)
+          .forEach((value) => acc.push(value));
+        return acc;
+      }, []);
+
+      if (fromCommonPrefixes.length) {
+        return fromCommonPrefixes;
+      }
+
+      const keyNodes = getElementsByTag(xmlDocument, 'Key');
+      const fromKeys = keyNodes
+        .map((node) => normalizePrefix(node.textContent || ''))
+        .map((value) => value.split('/')[0] || '')
+        .filter(Boolean);
+
+      return fromKeys;
+    };
+
+    const fetchVersionsForFolder = async (folder) => {
+      const versions = [];
+      let continuationToken = null;
+
+      do {
+        const params = new URLSearchParams({
+          'list-type': '2',
+          prefix: `${folder}/`,
+          delimiter: '/',
+        });
+
+        if (continuationToken) {
+          params.append('continuation-token', continuationToken);
+        }
+
+        const url = buildListingUrl(folder, params.toString(), listingBase);
+        const requestOptions = {
+          cache: 'no-store',
+          headers: {
+            Accept: 'application/xml,text/xml;q=0.9',
+          },
+        };
+
+        let response = await fetch(url, requestOptions);
+
+        if (response.status === 304) {
+          response = await fetch(url, { ...requestOptions, cache: 'reload' });
+        }
+
+        if (!response.ok) {
+          throw new Error(`Failed to list versions for ${folder}: ${response.status} ${response.statusText}`);
+        }
+
+        if (typeof DOMParser === 'undefined') {
+          throw new Error('DOMParser is not available in this environment.');
+        }
+
+        const xmlText = await response.text();
+
+        if (!xmlText.trim()) {
+          throw new Error('Received empty version listing response.');
+        }
+
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('xml') && /^\s*<!doctype\s+html/i.test(xmlText)) {
+          if (listingBase !== baseDomain) {
+          listingBase = baseDomain;
+          setListingBase(baseDomain);
+          continue;
+        }
+          throw new Error('Received HTML instead of XML when listing versions.');
+        }
+
+        const parser = new DOMParser();
+        const xmlDocument = parser.parseFromString(xmlText, 'application/xml');
+
+        const hasParseError = (
+          xmlDocument.querySelector?.('parsererror') ||
+          xmlDocument.querySelector?.('ParserError') ||
+          getElementsByTag(xmlDocument, 'parsererror')[0] ||
+          getElementsByTag(xmlDocument, 'ParserError')[0]
+        );
+
+        if (hasParseError) {
+          throw new Error('Unable to parse version listing response.');
+        }
+
+        const errorNode = getElementsByTag(xmlDocument, 'Error')[0];
+        if (errorNode) {
+          const code = getElementsByTag(errorNode, 'Code')[0]?.textContent || 'UnknownCode';
+          const message = getElementsByTag(errorNode, 'Message')[0]?.textContent || 'Unknown error';
+          throw new Error(`S3 error while listing ${folder}: ${code} - ${message}`);
+        }
+
+        const pageVersions = extractVersionsFromDocument(xmlDocument, folder);
+        versions.push(...pageVersions);
+
+        const isTruncated = getElementsByTag(xmlDocument, 'IsTruncated')[0]?.textContent === 'true';
+        continuationToken = isTruncated
+          ? getElementsByTag(xmlDocument, 'NextContinuationToken')[0]?.textContent || null
+          : null;
+      } while (continuationToken);
+
+      return versions;
+    };
+
+    const loadAvailableVersions = async () => {
+      setIsLoadingVersions(true);
+      setVersionLoadError(null);
+
+      try {
+        const [terminologyList, providerList] = await Promise.all([
+          fetchVersionsForFolder(default_folder),
+          fetchVersionsForFolder(provider_folder)
+        ]);
+
+        if (!isMounted) {
+          return;
+        }
+
+        const uniqueVersions = Array.from(new Set([...terminologyList, ...providerList])).filter(Boolean);
+
+        const normalizeForSort = (value) => value.replace(/_/g, '.');
+        const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+        const latestLabel = 'latest';
+        const withoutLatest = uniqueVersions.filter((version) => version.toLowerCase() !== latestLabel);
+        if (withoutLatest.length > 1) {
+          withoutLatest.sort((a, b) => collator.compare(normalizeForSort(b), normalizeForSort(a)));
+        }
+
+        const hasLatest = uniqueVersions.some((version) => version.toLowerCase() === latestLabel);
+        const orderedVersions = hasLatest ? [...withoutLatest, latestLabel] : withoutLatest;
+
+        setTerminologyVersions(orderedVersions);
+
+        if (orderedVersions.length) {
+          setTerminologyVersion((current) => {
+            if (!userSelectedVersionRef.current) {
+              return orderedVersions[0];
+            }
+
+            if (current && orderedVersions.includes(current)) {
+              return current;
+            }
+
+            return orderedVersions[0];
+          });
+        }
+      } catch (err) {
+        console.error('Failed to load terminology versions from S3', err);
+        if (isMounted) {
+          setVersionLoadError('Unable to load versions from S3. Displaying latest available version.');
+        }
+      } finally {
+        if (isMounted) {
+          setIsLoadingVersions(false);
+        }
+      }
+    };
+
+    loadAvailableVersions();
+
+    return () => {
+      isMounted = false;
+    };
   }, []);
+
+  useEffect(() => {
+    if (!terminologyVersion) {
+      setFileGroups([]);
+      setSelectedGroupId(null);
+      setCurrentFileName(null);
+      setCurrentFileFolder(default_folder);
+      setIsLoadingFiles(false);
+      setFileLoadError(null);
+      return;
+    }
+
+    let isMounted = true;
+    setIsLoadingFiles(true);
+    setFileLoadError(null);
+    setFileGroups([]);
+    setSelectedGroupId(null);
+    setCurrentFileName(null);
+    setCurrentFileFolder(default_folder);
+
+    let listingBase = getListingBase();
+
+    const fetchFilesForFolder = async (folder) => {
+      const files = [];
+      let continuationToken = null;
+
+      do {
+        const params = new URLSearchParams({
+          'list-type': '2',
+          prefix: `${folder}/${terminologyVersion}/`,
+        });
+
+        if (continuationToken) {
+          params.append('continuation-token', continuationToken);
+        }
+
+        const url = buildListingUrl(folder, params.toString(), listingBase);
+        const requestOptions = {
+          cache: 'no-store',
+          headers: {
+            Accept: 'application/xml,text/xml;q=0.9',
+          },
+        };
+
+        let response = await fetch(url, requestOptions);
+
+        if (response.status === 304) {
+          response = await fetch(url, { ...requestOptions, cache: 'reload' });
+        }
+
+        if (!response.ok) {
+          throw new Error(`Failed to list files for ${folder}: ${response.status} ${response.statusText}`);
+        }
+
+        if (typeof DOMParser === 'undefined') {
+          throw new Error('DOMParser is not available in this environment.');
+        }
+
+        const xmlText = await response.text();
+
+        if (!xmlText.trim()) {
+          throw new Error('Received empty file listing response.');
+        }
+
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('xml') && /^\s*<!doctype\s+html/i.test(xmlText)) {
+          if (listingBase !== baseDomain) {
+            listingBase = baseDomain;
+            setListingBase(baseDomain);
+            continue;
+          }
+          throw new Error('Received HTML instead of XML when listing files.');
+        }
+
+        const parser = new DOMParser();
+        const xmlDocument = parser.parseFromString(xmlText, 'application/xml');
+
+        const hasParseError = (
+          xmlDocument.querySelector?.('parsererror') ||
+          xmlDocument.querySelector?.('ParserError') ||
+          getElementsByTag(xmlDocument, 'parsererror')[0] ||
+          getElementsByTag(xmlDocument, 'ParserError')[0]
+        );
+
+        if (hasParseError) {
+          throw new Error('Unable to parse file listing response.');
+        }
+
+        const contentsNodes = getElementsByTag(xmlDocument, 'Contents');
+        contentsNodes.forEach((node) => {
+          const keyNode = getElementsByTag(node, 'Key')[0];
+          const keyText = keyNode?.textContent || '';
+          if (!keyText || keyText.endsWith('/')) {
+            return;
+          }
+          const relative = keyText.replace(`${folder}/${terminologyVersion}/`, '').trim();
+          if (relative) {
+            files.push(relative);
+          }
+        });
+
+        const isTruncated = getElementsByTag(xmlDocument, 'IsTruncated')[0]?.textContent === 'true';
+        continuationToken = isTruncated
+          ? getElementsByTag(xmlDocument, 'NextContinuationToken')[0]?.textContent || null
+          : null;
+      } while (continuationToken);
+
+      return files;
+    };
+
+    const loadFilesForVersion = async () => {
+      try {
+        const [terminologyFiles, providerFiles] = await Promise.all([
+          fetchFilesForFolder(default_folder),
+          fetchFilesForFolder(provider_folder).catch((err) => {
+            console.warn('Failed to load provider files from S3', err);
+            return [];
+          }),
+        ]);
+
+        if (!isMounted) {
+          return;
+        }
+
+        const entries = [
+          ...terminologyFiles.map((fileName) => ({ folder: default_folder, fileName })),
+          ...providerFiles.map((fileName) => ({ folder: provider_folder, fileName })),
+        ];
+
+        const groups = buildFileGroups(entries);
+
+        setFileGroups(groups);
+
+        if (!groups.length) {
+          setSelectedGroupId(null);
+          setCurrentFileName(null);
+          setCurrentFileFolder(default_folder);
+          return;
+        }
+
+        const firstGroup = groups[0];
+        setSelectedGroupId(firstGroup.id);
+        setCurrentFileName(firstGroup.files[0] || null);
+        setCurrentFileFolder(firstGroup.folder);
+      } catch (err) {
+        console.error('Failed to load terminology files from S3', err);
+        if (isMounted) {
+          setFileLoadError('Unable to load file listing for this version.');
+          setFileGroups([]);
+          setSelectedGroupId(null);
+          setCurrentFileName(null);
+          setCurrentFileFolder(default_folder);
+        }
+      } finally {
+        if (isMounted) {
+          setIsLoadingFiles(false);
+        }
+      }
+    };
+
+    loadFilesForVersion();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [terminologyVersion]);
 
   // Helper function to process CSV string and update state
   const processCsvString = (csvString, isPartial = false, forceLimit = false) => {
@@ -227,23 +719,67 @@ export default function CSVViewer() {
   // This effect will trigger whenever terminologyVersion or currentFileName changes
   useEffect(() => {
     const url = getCurrentUrl();
+    if (!url) {
+      return;
+    }
     fetchAndProcessCSV(url);
     // Reset pagination when URL changes
     setCurrentPage(1);
-  }, [currentFileName, terminologyVersion]);
+  }, [currentFileName, currentFileFolder, terminologyVersion]);
 
-  const handleFileSelect = (filename) => {
-    setCurrentFileName(filename);
+  const handleGroupSelect = (groupId) => {
+    const group = fileGroups.find((item) => item.id === groupId);
+    if (!group) {
+      return;
+    }
+
+    setSelectedGroupId(groupId);
+    const nextFile = group.files[0] || null;
+    setCurrentFileName(nextFile);
+    setCurrentFileFolder(group.folder);
+  };
+
+  const handleFileSegmentSelect = (groupId, fileName) => {
+    const group = fileGroups.find((item) => item.id === groupId);
+    if (!group) {
+      return;
+    }
+
+    if (!group.files.includes(fileName)) {
+      return;
+    }
+
+    setSelectedGroupId(groupId);
+    setCurrentFileName(fileName);
+    setCurrentFileFolder(group.folder);
   };
 
   const handleVersionChange = (version) => {
+    if (!version) {
+      return;
+    }
+    userSelectedVersionRef.current = true;
     setTerminologyVersion(version);
     // The useEffect will automatically trigger and reload the current file with the new version
   };
 
-  const filteredFiles = terminologyFiles.filter(file =>
-    file.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const normalizedSearch = searchTerm.trim().toLowerCase();
+  const filteredGroups = fileGroups.filter((group) => {
+    if (!normalizedSearch) {
+      return true;
+    }
+
+    const haystack = [group.displayName, group.csvName, ...group.files].join(' ').toLowerCase();
+    return haystack.includes(normalizedSearch);
+  });
+
+  const selectedGroup = fileGroups.find((group) => group.id === selectedGroupId) || null;
+
+  const availableVersions = terminologyVersions.length
+    ? terminologyVersions
+    : (terminologyVersion ? [terminologyVersion] : []);
+
+  const currentFileUrl = getCurrentUrl();
 
   return (
     <div style={{
@@ -272,57 +808,57 @@ export default function CSVViewer() {
 
         <div style={{
           display: 'flex',
-          alignItems: 'center',
-          backgroundColor: '#f3f4f6',
-          borderRadius: '8px',
-          padding: '4px'
+          flexDirection: 'column',
+          alignItems: 'flex-end',
+          maxWidth: '100%'
         }}>
-          <span style={{ marginRight: '8px', fontSize: '14px', fontWeight: 500 }}>Version:</span>
-          <button
-            onClick={() => handleVersionChange('0.14.16')}
+          <label htmlFor="terminology-version" style={{
+            fontSize: '12px',
+            fontWeight: 600,
+            color: '#4b5563',
+            marginBottom: '4px'
+          }}>
+            Terminology version
+          </label>
+          <select
+            id="terminology-version"
+            value={terminologyVersion ?? ''}
+            onChange={(event) => handleVersionChange(event.target.value)}
+            disabled={isLoadingVersions || !availableVersions.length}
             style={{
-              padding: '6px 12px',
-              borderRadius: '6px',
-              border: 'none',
-              backgroundColor: terminologyVersion === '0.14.16' ? '#3b82f6' : 'transparent',
-              color: terminologyVersion === '0.14.16' ? 'white' : '#6b7280',
+              minWidth: '200px',
+              padding: '8px 12px',
+              borderRadius: '8px',
+              border: '1px solid #d1d5db',
               fontSize: '14px',
               fontWeight: 500,
-              cursor: 'pointer'
+              color: '#111827',
+              backgroundColor: isLoadingVersions ? '#f9fafb' : 'white'
             }}
           >
-            0.14.16
-          </button>
-          <button
-            onClick={() => handleVersionChange('0.14.17')}
-            style={{
-              padding: '6px 12px',
-              borderRadius: '6px',
-              border: 'none',
-              backgroundColor: terminologyVersion === '0.14.17' ? '#3b82f6' : 'transparent',
-              color: terminologyVersion === '0.14.17' ? 'white' : '#6b7280',
-              fontSize: '14px',
-              fontWeight: 500,
-              cursor: 'pointer'
-            }}
-          >
-            0.14.17
-          </button>
-          <button
-            onClick={() => handleVersionChange('0.14.18')}
-            style={{
-              padding: '6px 12px',
-              borderRadius: '6px',
-              border: 'none',
-              backgroundColor: terminologyVersion === '0.14.18' ? '#3b82f6' : 'transparent',
-              color: terminologyVersion === '0.14.18' ? 'white' : '#6b7280',
-              fontSize: '14px',
-              fontWeight: 500,
-              cursor: 'pointer'
-            }}
-          >
-            0.14.18
-          </button>
+            {isLoadingVersions ? (
+              <option value="" disabled>Loading versions…</option>
+            ) : (
+              <>
+                {!terminologyVersion && <option value="" disabled>Choose a version</option>}
+                {availableVersions.map((version) => (
+                  <option key={version} value={version}>
+                    {version}
+                  </option>
+                ))}
+              </>
+            )}
+          </select>
+          {!isLoadingVersions && !availableVersions.length && !versionLoadError && (
+            <span style={{ marginTop: '4px', fontSize: '12px', color: '#dc2626' }}>
+              No versions available
+            </span>
+          )}
+          {versionLoadError && (
+            <span style={{ marginTop: '4px', fontSize: '12px', color: '#dc2626' }}>
+              {versionLoadError}
+            </span>
+          )}
         </div>
       </div>
 
@@ -379,34 +915,68 @@ export default function CSVViewer() {
           overflowY: 'auto',
           flexGrow: 1
         }}>
-          {filteredFiles.map((file, index) => (
-            <div
-              key={index}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                padding: '8px',
-                cursor: 'pointer',
-                borderRadius: '6px',
-                marginBottom: '2px',
-                backgroundColor: currentFileName === file ? '#dbeafe' : 'transparent'
-              }}
-              onClick={() => handleFileSelect(file)}
-            >
-              <FileText style={{
-                width: '16px',
-                height: '16px',
-                marginRight: '8px',
-                color: '#3b82f6'
-              }} />
-              <span style={{
-                fontSize: '14px',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis'
-              }}>{file}</span>
+          {isLoadingFiles ? (
+            <div style={{ padding: '16px', color: '#6b7280', fontSize: '14px' }}>
+              Loading file list...
             </div>
-          ))}
+          ) : fileLoadError ? (
+            <div style={{ padding: '16px', color: '#dc2626', fontSize: '14px' }}>
+              {fileLoadError}
+            </div>
+          ) : filteredGroups.length ? (
+            filteredGroups.map((group) => (
+              <div
+                key={group.id}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  padding: '8px',
+                  cursor: 'pointer',
+                  borderRadius: '6px',
+                  marginBottom: '2px',
+                  backgroundColor: selectedGroupId === group.id ? '#dbeafe' : 'transparent'
+                }}
+                onClick={() => handleGroupSelect(group.id)}
+              >
+                <FileText style={{
+                  width: '16px',
+                  height: '16px',
+                  marginRight: '8px',
+                  color: '#3b82f6'
+                }} />
+                <div style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  overflow: 'hidden'
+                }}>
+                  <span style={{
+                    fontSize: '14px',
+                    fontWeight: selectedGroupId === group.id ? 600 : 500,
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis'
+                  }}>
+                    {group.displayName}
+                  </span>
+                  <span style={{
+                    fontSize: '12px',
+                    color: '#6b7280',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis'
+                  }}>
+                    {group.csvName}
+                    {group.folder === provider_folder ? ' · Provider data' : ''}
+                    {group.files.length > 1 ? ' · ' + group.files.length + ' files' : ''}
+                  </span>
+                </div>
+              </div>
+            ))
+          ) : (
+            <div style={{ padding: '16px', color: '#6b7280', fontSize: '14px' }}>
+              No files match your search.
+            </div>
+          )}
         </div>
       </div>
 
@@ -435,9 +1005,58 @@ export default function CSVViewer() {
               fontWeight: 600,
               margin: 0
             }}>
-              {currentFileName}
+              {selectedGroup ? selectedGroup.displayName : (currentFileName || 'Select a file')}
             </h2>
-          {!loading && !error && (
+            {selectedGroup && (
+              <p style={{
+                fontSize: '13px',
+                color: '#6b7280',
+                marginTop: '4px',
+                marginBottom: selectedGroup.files.length ? 8 : 0
+              }}>
+                {selectedGroup.csvName}
+                {selectedGroup.folder === provider_folder ? ' · Provider data' : ''}
+              </p>
+            )}
+            {selectedGroup && selectedGroup.files.length > 0 && (
+              <div style={{ marginBottom: '8px' }}>
+                <span style={{
+                  fontSize: '12px',
+                  color: '#6b7280',
+                  display: 'block',
+                  marginBottom: '4px'
+                }}>
+                  Files included:
+                </span>
+                <div style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: '8px'
+                }}>
+                  {selectedGroup.files.map((file) => (
+                    <button
+                      key={file}
+                      type="button"
+                      onClick={() => handleFileSegmentSelect(selectedGroup.id, file)}
+                      style={{
+                        border: '1px solid ' + (file === currentFileName ? '#2563eb' : '#d1d5db'),
+                        backgroundColor: file === currentFileName ? '#dbeafe' : '#f9fafb',
+                        color: file === currentFileName ? '#1d4ed8' : '#374151',
+                        borderRadius: '9999px',
+                        padding: '4px 10px',
+                        fontSize: '12px',
+                        cursor: 'pointer',
+                        lineHeight: 1,
+                        whiteSpace: 'nowrap'
+                      }}
+                    >
+                      {file}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {!loading && !error && currentFileUrl && (
               <p style={{
                 fontSize: '14px',
                 color: '#6b7280',
@@ -447,12 +1066,12 @@ export default function CSVViewer() {
                 {isPartialData
                   ? `Partial load: ${csvData.length} rows`
                   : `Total rows: ${csvData.length}`}
-                  , Url: {getCurrentUrl()}
+                {currentFileUrl ? `, Url: ${currentFileUrl}` : ''}
               </p>
             )}
           </div>
           <a
-            href={getCurrentUrl()}
+            href={currentFileUrl || undefined}
             download
             style={{
               display: 'flex',
@@ -461,6 +1080,7 @@ export default function CSVViewer() {
               fontSize: '14px',
               textDecoration: 'none'
             }}
+            aria-disabled={!currentFileUrl}
           >
             <Download style={{
               width: '16px',
