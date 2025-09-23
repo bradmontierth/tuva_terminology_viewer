@@ -1,7 +1,182 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { Search, Download, FileText, Loader2 } from 'lucide-react';
 import * as Papa from 'papaparse';
 import pako from 'pako';
+
+const MAX_INDEX_SEARCH_RESULTS = 500;
+
+const tokenizeQuery = (value = '') => Array.from(new Set(
+  value
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+));
+
+const intersectSortedArrays = (arrA, arrB) => {
+  if (!arrA || !arrB) {
+    return [];
+  }
+
+  const result = [];
+  let i = 0;
+  let j = 0;
+
+  while (i < arrA.length && j < arrB.length) {
+    const valueA = arrA[i];
+    const valueB = arrB[j];
+
+    if (valueA === valueB) {
+      result.push(valueA);
+      i += 1;
+      j += 1;
+      continue;
+    }
+
+    if (valueA < valueB) {
+      i += 1;
+    } else {
+      j += 1;
+    }
+  }
+
+  return result;
+};
+
+const normalizeIndexPayload = (raw = {}) => {
+  const tokens = Array.isArray(raw.tokens) ? raw.tokens : [];
+  const defaultLookup = Object.fromEntries(tokens.map((token, index) => [token, index]));
+
+  return {
+    dataset: raw.dataset || null,
+    generatedAt: raw.generatedAt || null,
+    totalRows: typeof raw.totalRows === 'number' ? raw.totalRows : 0,
+    maxColumns: typeof raw.maxColumns === 'number' ? raw.maxColumns : 0,
+    files: Array.isArray(raw.files) ? raw.files : [],
+    dictionary: Array.isArray(raw.dictionary) ? raw.dictionary : [],
+    rows: Array.isArray(raw.rows) ? raw.rows : [],
+    rowFiles: raw.rowFiles ? new Uint16Array(raw.rowFiles) : new Uint16Array(),
+    rowPositions: raw.rowPositions ? new Uint32Array(raw.rowPositions) : new Uint32Array(),
+    tokens,
+    tokenLookup: raw.tokenLookup && typeof raw.tokenLookup === 'object'
+      ? raw.tokenLookup
+      : defaultLookup,
+    postings: Array.isArray(raw.postings)
+      ? raw.postings.map((posting) => new Uint32Array(posting))
+      : [],
+  };
+};
+
+const buildIndexSearchResults = (query, searchIndex, limit = MAX_INDEX_SEARCH_RESULTS) => {
+  if (!searchIndex) {
+    return {
+      rows: [],
+      matchCount: 0,
+      truncated: false,
+    };
+  }
+
+  const normalizedQuery = query.trim().toLowerCase();
+  const terms = tokenizeQuery(normalizedQuery);
+
+  if (!terms.length) {
+    return {
+      rows: [],
+      matchCount: 0,
+      truncated: false,
+    };
+  }
+
+  let candidateRows = null;
+
+  for (const term of terms) {
+    const tokenIndex = searchIndex.tokenLookup?.[term];
+    let termPostings;
+
+    if (typeof tokenIndex === 'number' && searchIndex.postings[tokenIndex]) {
+      termPostings = searchIndex.postings[tokenIndex];
+    } else {
+      const fallbackSet = new Set();
+      for (let i = 0; i < searchIndex.tokens.length; i += 1) {
+        if (searchIndex.tokens[i]?.includes(term)) {
+          const posting = searchIndex.postings[i];
+          for (let j = 0; j < posting.length; j += 1) {
+            fallbackSet.add(posting[j]);
+          }
+        }
+      }
+
+      if (!fallbackSet.size) {
+        return {
+          rows: [],
+          matchCount: 0,
+          truncated: false,
+        };
+      }
+
+      termPostings = Array.from(fallbackSet).sort((a, b) => a - b);
+    }
+
+    if (!termPostings || !termPostings.length) {
+      return {
+        rows: [],
+        matchCount: 0,
+        truncated: false,
+      };
+    }
+
+    if (candidateRows === null) {
+      candidateRows = termPostings;
+    } else {
+      candidateRows = intersectSortedArrays(candidateRows, termPostings);
+    }
+
+    if (!candidateRows.length) {
+      return {
+        rows: [],
+        matchCount: 0,
+        truncated: false,
+      };
+    }
+  }
+
+  const matches = [];
+  const dictionary = searchIndex.dictionary;
+  const lowerQuery = normalizedQuery;
+
+  for (let i = 0; i < candidateRows.length; i += 1) {
+    const rowIndex = candidateRows[i];
+    const encodedRow = searchIndex.rows[rowIndex];
+
+    if (!Array.isArray(encodedRow)) {
+      continue;
+    }
+
+    const rowValues = encodedRow.map((valueIndex) => dictionary[valueIndex] ?? '');
+    const rowText = rowValues.join(' ').toLowerCase();
+
+    if (!rowText.includes(lowerQuery)) {
+      continue;
+    }
+
+    matches.push({
+      rowIndex,
+      values: rowValues,
+      fileIndex: searchIndex.rowFiles[rowIndex] ?? 0,
+      rowPosition: searchIndex.rowPositions[rowIndex] ?? 0,
+    });
+
+    if (matches.length >= limit) {
+      break;
+    }
+  }
+
+  return {
+    rows: matches,
+    matchCount: candidateRows.length,
+    truncated: candidateRows.length > matches.length,
+  };
+};
 
 export default function CSVViewer() {
   const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';
@@ -29,6 +204,10 @@ export default function CSVViewer() {
   const [fileLoadError, setFileLoadError] = useState(null);
   const userSelectedVersionRef = useRef(false);
   const listingBaseRef = useRef(null);
+  const indexCacheRef = useRef(new Map());
+  const [searchIndex, setSearchIndex] = useState(null);
+  const [isLoadingIndex, setIsLoadingIndex] = useState(false);
+  const [indexError, setIndexError] = useState(null);
 
   const determineListingBase = () => {
     if (typeof window === 'undefined') {
@@ -159,6 +338,11 @@ export default function CSVViewer() {
   const createGroupId = (folder, csvName) => `${folder}::${csvName.toLowerCase()}`;
 
 
+  const baseCsvName = useMemo(
+    () => (currentFileName ? toBaseCsvName(currentFileName) : null),
+    [currentFileName]
+  );
+
   const buildFileGroups = (fileEntries) => {
     const groups = new Map();
 
@@ -201,12 +385,31 @@ export default function CSVViewer() {
     return sortedGroups;
   };
   // Generate the current URL based on filename and version
+  const buildObjectUrl = (folder, version, fileName) => {
+    if (!folder || !version || !fileName) {
+      return '';
+    }
+
+    const normalizedFolder = folder
+      .replace(/\\/g, '/')
+      .replace(/^\/+|\/+$/g, '');
+
+    const normalizedVersion = String(version)
+      .trim()
+      .replace(/^\/+|\/+$/g, '');
+
+    const sanitizedFile = fileName.replace(/^\/+/, '');
+    const base = baseDomain.replace(/\/$/, '');
+
+    return `${base}/${normalizedFolder}/${normalizedVersion}/${sanitizedFile}`;
+  };
+
   const getCurrentUrl = (version = terminologyVersion, folder = currentFileFolder) => {
     if (!version || !currentFileName) {
       return '';
     }
     const targetFolder = folder || default_folder;
-    return `${baseDomain}/${targetFolder}/${version}/${currentFileName}`;
+    return buildObjectUrl(targetFolder, version, currentFileName);
   };
 
   useEffect(() => {
@@ -727,6 +930,200 @@ export default function CSVViewer() {
     setCurrentPage(1);
   }, [currentFileName, currentFileFolder, terminologyVersion]);
 
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [filterTerm]);
+
+  useEffect(() => {
+    if (!searchIndex || !searchIndex.maxColumns) {
+      return;
+    }
+
+    setHeaders((current) => {
+      const existing = Array.isArray(current) ? current : [];
+      if (existing.length >= searchIndex.maxColumns) {
+        return existing;
+      }
+
+      const next = existing.slice();
+      while (next.length < searchIndex.maxColumns) {
+        next.push(`Column ${next.length + 1}`);
+      }
+      return next;
+    });
+  }, [searchIndex]);
+
+  const tableComputation = useMemo(() => {
+    const normalizedQuery = filterTerm.trim().toLowerCase();
+
+    if (searchIndex && normalizedQuery) {
+      const indexResult = buildIndexSearchResults(normalizedQuery, searchIndex, MAX_INDEX_SEARCH_RESULTS);
+      if (indexResult.rows.length) {
+        return {
+          source: 'index',
+          rows: indexResult.rows.map((entry) => entry.values),
+          totalMatches: indexResult.rows.length,
+          matchCount: indexResult.matchCount,
+          truncated: indexResult.truncated,
+          rowMetadata: indexResult.rows,
+        };
+      }
+    }
+
+    const fallbackRows = normalizedQuery
+      ? csvData.filter((row) => row.some((cell) => cell && String(cell).toLowerCase().includes(normalizedQuery)))
+      : csvData;
+
+    return {
+      source: normalizedQuery ? 'preview-filter' : 'preview',
+      rows: fallbackRows,
+      totalMatches: fallbackRows.length,
+      matchCount: fallbackRows.length,
+      truncated: false,
+      rowMetadata: null,
+    };
+  }, [filterTerm, searchIndex, csvData]);
+
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil((tableComputation.rows.length || 1) / pageSize));
+    setCurrentPage((prev) => Math.min(prev, totalPages));
+  }, [tableComputation.rows.length, pageSize]);
+
+  const startIndex = (currentPage - 1) * pageSize;
+  const endIndex = startIndex + pageSize;
+  const paginatedRows = tableComputation.rows.slice(startIndex, endIndex);
+  const totalPages = Math.max(1, Math.ceil((tableComputation.rows.length || 1) / pageSize));
+  const summaryText = (() => {
+    if (tableComputation.source === 'index') {
+      const displayed = tableComputation.totalMatches.toLocaleString();
+      const totalMatchesText = typeof tableComputation.matchCount === 'number'
+        ? tableComputation.matchCount.toLocaleString()
+        : null;
+      const limitedText = tableComputation.truncated
+        ? ` (showing first ${MAX_INDEX_SEARCH_RESULTS.toLocaleString()} matches)`
+        : '';
+      return `Index search: showing ${displayed}${totalMatchesText ? ` of ${totalMatchesText}` : ''} matches${limitedText}`;
+    }
+
+    if (tableComputation.source === 'preview-filter') {
+      return `Filtered preview rows: ${tableComputation.totalMatches.toLocaleString()} of ${csvData.length.toLocaleString()} preview rows`;
+    }
+
+    if (isPartialData) {
+      return `Partial load preview: ${csvData.length.toLocaleString()} rows`;
+    }
+
+    return `Preview rows loaded: ${csvData.length.toLocaleString()}`;
+  })();
+  const showIndexReady = Boolean(searchIndex && !isLoadingIndex && !indexError);
+
+  useEffect(() => {
+    if (!baseCsvName || !terminologyVersion) {
+      setSearchIndex(null);
+      setIndexError(null);
+      setIsLoadingIndex(false);
+      return;
+    }
+
+    const targetFolder = currentFileFolder || default_folder;
+    const cacheKey = `${targetFolder}::${terminologyVersion}::${baseCsvName.toLowerCase()}`;
+    const cached = indexCacheRef.current.get(cacheKey);
+
+    if (cached) {
+      setSearchIndex(cached);
+      setIndexError(null);
+      setIsLoadingIndex(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    const fetchIndex = async () => {
+      const candidates = [
+        `${baseCsvName}.index.json.gz`,
+        `${baseCsvName}.index.json`
+      ];
+
+      let lastError = null;
+
+      for (const candidate of candidates) {
+        const url = buildObjectUrl(targetFolder, terminologyVersion, candidate);
+        if (!url) {
+          continue;
+        }
+
+        try {
+          const response = await fetch(url, { cache: 'no-store' });
+          if (!response.ok) {
+            if (response.status === 404) {
+              lastError = new Error(`Index file not found: ${candidate}`);
+              continue;
+            }
+            throw new Error(`Failed to fetch ${candidate}: ${response.status} ${response.statusText}`);
+          }
+
+          const arrayBuffer = await response.arrayBuffer();
+          let jsonText;
+
+          if (candidate.endsWith('.gz')) {
+            try {
+              const decompressed = pako.ungzip(new Uint8Array(arrayBuffer), { to: 'string' });
+              jsonText = typeof decompressed === 'string'
+                ? decompressed
+                : new TextDecoder('utf-8').decode(decompressed);
+            } catch (decompressionError) {
+              lastError = new Error(`Unable to decompress ${candidate}: ${decompressionError.message}`);
+              continue;
+            }
+          } else {
+            jsonText = new TextDecoder('utf-8').decode(arrayBuffer);
+          }
+
+          const parsed = JSON.parse(jsonText);
+          return normalizeIndexPayload(parsed);
+        } catch (err) {
+          lastError = err;
+        }
+      }
+
+      if (lastError) {
+        throw lastError;
+      }
+
+      throw new Error('Index file not found for this dataset.');
+    };
+
+    setIsLoadingIndex(true);
+    setIndexError(null);
+    setSearchIndex(null);
+
+    fetchIndex()
+      .then((indexData) => {
+        if (cancelled) {
+          return;
+        }
+        indexCacheRef.current.set(cacheKey, indexData);
+        setSearchIndex(indexData);
+      })
+      .catch((err) => {
+        if (cancelled) {
+          return;
+        }
+        console.warn(`Search index unavailable for ${cacheKey}`, err);
+        setIndexError(err.message || 'Search index unavailable for this dataset.');
+        setSearchIndex(null);
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsLoadingIndex(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [baseCsvName, currentFileFolder, default_folder, terminologyVersion]);
+
   const handleGroupSelect = (groupId) => {
     const group = fileGroups.find((item) => item.id === groupId);
     if (!group) {
@@ -1056,18 +1453,52 @@ export default function CSVViewer() {
                 </div>
               </div>
             )}
-            {!loading && !error && currentFileUrl && (
-              <p style={{
-                fontSize: '14px',
-                color: '#6b7280',
-                marginTop: '4px',
-                marginBottom: 0
-              }}>
-                {isPartialData
-                  ? `Partial load: ${csvData.length} rows`
-                  : `Total rows: ${csvData.length}`}
-                {currentFileUrl ? `, Url: ${currentFileUrl}` : ''}
-              </p>
+            {!loading && !error && (
+              <div style={{ marginTop: '4px' }}>
+                <p style={{
+                  fontSize: '14px',
+                  color: '#6b7280',
+                  margin: 0
+                }}>
+                  {summaryText}
+                </p>
+                {isLoadingIndex && (
+                  <p style={{
+                    fontSize: '12px',
+                    color: '#6b7280',
+                    margin: '4px 0 0 0'
+                  }}>
+                    Loading search index…
+                  </p>
+                )}
+                {indexError && !isLoadingIndex && (
+                  <p style={{
+                    fontSize: '12px',
+                    color: '#dc2626',
+                    margin: '4px 0 0 0'
+                  }}>
+                    {indexError}
+                  </p>
+                )}
+                {showIndexReady && (
+                  <p style={{
+                    fontSize: '12px',
+                    color: '#6b7280',
+                    margin: '4px 0 0 0'
+                  }}>
+                    Index ready · {searchIndex.totalRows.toLocaleString()} rows searchable
+                  </p>
+                )}
+                {currentFileUrl && (
+                  <p style={{
+                    fontSize: '12px',
+                    color: '#6b7280',
+                    margin: '4px 0 0 0'
+                  }}>
+                    URL: {currentFileUrl}
+                  </p>
+                )}
+              </div>
             )}
           </div>
           <a
@@ -1156,6 +1587,24 @@ export default function CSVViewer() {
                   height: '16px'
                 }} />
               </div>
+              {tableComputation.source === 'index' && tableComputation.truncated && (
+                <div style={{
+                  fontSize: '12px',
+                  color: '#6b7280',
+                  marginBottom: '12px'
+                }}>
+                  Showing first {MAX_INDEX_SEARCH_RESULTS.toLocaleString()} matches. Refine the search to narrow results.
+                </div>
+              )}
+              {!searchIndex && !isLoadingIndex && !indexError && (
+                <div style={{
+                  fontSize: '12px',
+                  color: '#6b7280',
+                  marginBottom: '12px'
+                }}>
+                  Search is limited to the preview because no pre-built index was found for this dataset.
+                </div>
+              )}
               
               <div style={{
                 overflowY: 'auto',
@@ -1193,37 +1642,32 @@ export default function CSVViewer() {
                     </tr>
                   </thead>
                   <tbody>
-                    {csvData
-                      .filter(row => {
-                        if (!filterTerm) return true;
-                        return row.some(cell => 
-                          cell && String(cell).toLowerCase().includes(filterTerm.toLowerCase())
-                        );
-                      })
-                      .slice((currentPage - 1) * pageSize, currentPage * pageSize)
-                      .map((row, rowIndex) => (
-                      <tr 
-                        key={rowIndex}
-                        style={{
-                          backgroundColor: rowIndex % 2 === 0 ? 'white' : '#f9fafb'
-                        }}
-                      >
-                        {row.map((cell, cellIndex) => (
-                          <td 
-                            key={cellIndex}
-                            style={{
-                              padding: '8px 24px',
-                              whiteSpace: 'nowrap',
-                              fontSize: '14px',
-                              color: '#6b7280',
-                              borderBottom: '1px solid #e5e7eb'
-                            }}
-                          >
-                            {cell}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
+                    {paginatedRows.map((row, rowIndex) => {
+                      const globalIndex = startIndex + rowIndex;
+                      return (
+                        <tr
+                          key={globalIndex}
+                          style={{
+                            backgroundColor: globalIndex % 2 === 0 ? 'white' : '#f9fafb'
+                          }}
+                        >
+                          {row.map((cell, cellIndex) => (
+                            <td 
+                              key={cellIndex}
+                              style={{
+                                padding: '8px 24px',
+                                whiteSpace: 'nowrap',
+                                fontSize: '14px',
+                                color: '#6b7280',
+                                borderBottom: '1px solid #e5e7eb'
+                              }}
+                            >
+                              {cell}
+                            </td>
+                          ))}
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
                 
@@ -1259,55 +1703,40 @@ export default function CSVViewer() {
                   </div>
                   
                   <div style={{ display: 'flex', alignItems: 'center' }}>
-                    {(() => {
-                      // Calculate filtered data once to avoid repeated filtering
-                      const filteredData = csvData.filter(row => {
-                        if (!filterTerm) return true;
-                        return row.some(cell => 
-                          cell && String(cell).toLowerCase().includes(filterTerm.toLowerCase())
-                        );
-                      });
-                      const totalPages = Math.ceil(filteredData.length / pageSize) || 1;
-                      
-                      return (
-                        <>
-                          <button
-                            onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
-                            disabled={currentPage === 1}
-                            style={{
-                              padding: '4px 8px',
-                              border: '1px solid #d1d5db',
-                              borderRadius: '4px',
-                              marginRight: '8px',
-                              backgroundColor: currentPage === 1 ? '#f3f4f6' : 'white',
-                              cursor: currentPage === 1 ? 'not-allowed' : 'pointer',
-                              color: currentPage === 1 ? '#9ca3af' : '#111827'
-                            }}
-                          >
-                            Previous
-                          </button>
-                          
-                          <span style={{ margin: '0 8px', fontSize: '14px' }}>
-                            Page {currentPage} of {totalPages}
-                          </span>
-                          
-                          <button
-                            onClick={() => setCurrentPage(prev => Math.min(prev + 1, totalPages))}
-                            disabled={currentPage >= totalPages}
-                            style={{
-                              padding: '4px 8px',
-                              border: '1px solid #d1d5db',
-                              borderRadius: '4px',
-                              backgroundColor: currentPage >= totalPages ? '#f3f4f6' : 'white',
-                              cursor: currentPage >= totalPages ? 'not-allowed' : 'pointer',
-                              color: currentPage >= totalPages ? '#9ca3af' : '#111827'
-                            }}
-                          >
-                            Next
-                          </button>
-                        </>
-                      );
-                    })()}
+                    <button
+                      onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
+                      disabled={currentPage === 1}
+                      style={{
+                        padding: '4px 8px',
+                        border: '1px solid #d1d5db',
+                        borderRadius: '4px',
+                        marginRight: '8px',
+                        backgroundColor: currentPage === 1 ? '#f3f4f6' : 'white',
+                        cursor: currentPage === 1 ? 'not-allowed' : 'pointer',
+                        color: currentPage === 1 ? '#9ca3af' : '#111827'
+                      }}
+                    >
+                      Previous
+                    </button>
+
+                    <span style={{ margin: '0 8px', fontSize: '14px' }}>
+                      Page {Math.min(currentPage, totalPages)} of {totalPages}
+                    </span>
+
+                    <button
+                      onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
+                      disabled={currentPage >= totalPages}
+                      style={{
+                        padding: '4px 8px',
+                        border: '1px solid #d1d5db',
+                        borderRadius: '4px',
+                        backgroundColor: currentPage >= totalPages ? '#f3f4f6' : 'white',
+                        cursor: currentPage >= totalPages ? 'not-allowed' : 'pointer',
+                        color: currentPage >= totalPages ? '#9ca3af' : '#111827'
+                      }}
+                    >
+                      Next
+                    </button>
                   </div>
                 </div>
               </div>
