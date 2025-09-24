@@ -18,6 +18,10 @@
     "web-vitals": "^2.1.4"
   },
   "scripts": {
+    "generate:crosswalk": "node scripts/generateHeaderCrosswalk.js",
+    "prestart": "npm run generate:crosswalk",
+    "prebuild": "npm run generate:crosswalk",
+    "pretest": "npm run generate:crosswalk",
     "start": "react-scripts start",
     "build": "react-scripts build",
     "test": "react-scripts test",
@@ -44,6 +48,7 @@
     ]
   },
   "devDependencies": {
-    "gh-pages": "^6.3.0"
+    "gh-pages": "^6.3.0",
+    "js-yaml": "^4.1.0"
   }
 }
