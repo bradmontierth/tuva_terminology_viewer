@@ -2,6 +2,15 @@
 
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
 
+## Header Crosswalk
+
+This viewer now hydrates CSV headers from the Tuva dbt project so that the data exported to S3 can be rendered with friendly column names.
+
+- `npm run generate:crosswalk` builds `public/data/header-crosswalk.json` by inspecting every tagged release in the [`tuva`](https://github.com/tuva-health/tuva) repository. The script keeps a shallow clone under `scripts/.cache/tuva` (ignored in git).
+- The crosswalk step runs automatically before `npm start`, `npm run build`, and `npm test`. To skip a refresh you can set `TUVA_CROSSWALK_SKIP_FETCH=1` (reuse the existing clone) or `TUVA_CROSSWALK_DISABLE=1` (skip the step entirely).
+- Set `TUVA_REPO_URL`, `TUVA_REPO_DIR`, or `TUVA_CROSSWALK_OUTPUT` to override the default source repository, cache location, or output file.
+- When working without network access, generate the crosswalk once manually (or copy an existing JSON file) and reuse it locally via `TUVA_CROSSWALK_SKIP_FETCH=1`.
+
 ## Available Scripts
 
 In the project directory, you can run:

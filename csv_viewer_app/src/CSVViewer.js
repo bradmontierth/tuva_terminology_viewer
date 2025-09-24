@@ -3,6 +3,7 @@ import { Search, Download, FileText, Loader2 } from 'lucide-react';
 import * as Papa from 'papaparse';
 import pako from 'pako';
 import limits from './config/limits.json';
+import headerCrosswalkFallback from './generated/headerCrosswalk.json';
 
 const MAX_INDEX_SEARCH_RESULTS = 500;
 const PARTIAL_PREVIEW_ROW_LIMIT = typeof limits?.partialPreviewRowLimit === 'number'
@@ -205,6 +206,30 @@ const buildIndexSearchResults = (query, searchIndex, limit = MAX_INDEX_SEARCH_RE
 
 export { buildIndexSearchResults };
 
+const normalizeKey = (value = '') => value.trim().toLowerCase();
+
+const arraysEqual = (a = [], b = []) => {
+  if (a === b) {
+    return true;
+  }
+
+  if (!Array.isArray(a) || !Array.isArray(b)) {
+    return false;
+  }
+
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
 export default function CSVViewer() {
   const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';
   const default_folder = 'versioned_terminology';
@@ -214,7 +239,14 @@ export default function CSVViewer() {
   };
 
   const [csvData, setCsvData] = useState([]);
+  const [columnCount, setColumnCount] = useState(0);
   const [headers, setHeaders] = useState([]);
+  const [headerCrosswalk, setHeaderCrosswalk] = useState(() => {
+    if (headerCrosswalkFallback && typeof headerCrosswalkFallback === 'object') {
+      return headerCrosswalkFallback;
+    }
+    return null;
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [currentFileName, setCurrentFileName] = useState(null);
@@ -347,6 +379,145 @@ export default function CSVViewer() {
     return normalized;
   };
 
+  const isLatestVersion = (value = '') => normalizeKey(value) === 'latest';
+
+  const toVersionParts = (value = '') => {
+    if (!value) {
+      return [];
+    }
+
+    return value
+      .replace(/_/g, '.')
+      .split(/[^0-9A-Za-z]+/)
+      .filter(Boolean)
+      .map((part) => {
+        const numeric = Number(part);
+        return Number.isNaN(numeric) ? part.toLowerCase() : numeric;
+      });
+  };
+
+  const compareVersionStrings = (a = '', b = '') => {
+    if (isLatestVersion(a) && isLatestVersion(b)) {
+      return 0;
+    }
+    if (isLatestVersion(a)) {
+      return 1;
+    }
+    if (isLatestVersion(b)) {
+      return -1;
+    }
+
+    const aParts = toVersionParts(a);
+    const bParts = toVersionParts(b);
+    const maxLength = Math.max(aParts.length, bParts.length);
+
+    for (let index = 0; index < maxLength; index += 1) {
+      const aPart = aParts[index] ?? 0;
+      const bPart = bParts[index] ?? 0;
+
+      if (aPart === bPart) {
+        continue;
+      }
+
+      if (typeof aPart === 'string' || typeof bPart === 'string') {
+        const aString = String(aPart);
+        const bString = String(bPart);
+        if (aString > bString) {
+          return 1;
+        }
+        if (aString < bString) {
+          return -1;
+        }
+        continue;
+      }
+
+      if (aPart > bPart) {
+        return 1;
+      }
+      if (aPart < bPart) {
+        return -1;
+      }
+    }
+
+    return 0;
+  };
+
+  const resolveVersionMap = (folderMap, requestedVersion) => {
+    if (!folderMap || typeof folderMap !== 'object') {
+      return null;
+    }
+
+    const normalizedRequested = requestedVersion?.trim() || '';
+    const directMatch = folderMap[normalizedRequested] || folderMap[normalizeKey(normalizedRequested)];
+    if (directMatch && typeof directMatch === 'object') {
+      return { versionKey: normalizedRequested, map: directMatch, isFallback: false };
+    }
+
+    const versionKeys = Object.keys(folderMap);
+    if (!versionKeys.length) {
+      return null;
+    }
+
+    const sortedKeys = versionKeys.slice().sort((a, b) => compareVersionStrings(b, a));
+    const bestKey = sortedKeys.find((key) => compareVersionStrings(key, normalizedRequested) <= 0)
+      || sortedKeys[0];
+
+    const map = folderMap[bestKey];
+    if (!map || typeof map !== 'object') {
+      return null;
+    }
+
+    if (bestKey !== normalizedRequested) {
+      console.warn('Crosswalk missing version, using fallback', {
+        requestedVersion: normalizedRequested,
+        fallbackVersion: bestKey,
+      });
+    }
+
+    return { versionKey: bestKey, map, isFallback: bestKey !== normalizedRequested };
+  };
+
+  const resolveCrosswalkEntry = (folder, version, fileName) => {
+    if (!headerCrosswalk || typeof headerCrosswalk !== 'object') {
+      return null;
+    }
+
+    const normalizedFolder = normalizeKey(folder);
+    const baseName = normalizeKey(toBaseCsvName(fileName));
+    const requestedVersion = version || '';
+
+    if (!normalizedFolder || !baseName) {
+      return null;
+    }
+
+    const folderMap = headerCrosswalk[normalizedFolder];
+    if (!folderMap || typeof folderMap !== 'object') {
+      return null;
+    }
+
+    const versionResult = resolveVersionMap(folderMap, requestedVersion);
+    if (!versionResult) {
+      return null;
+    }
+
+    const { map: versionMap, versionKey, isFallback } = versionResult;
+    const entry = versionMap[baseName];
+
+    if (!entry) {
+      return null;
+    }
+
+    if (Array.isArray(entry)) {
+      return { headers: entry, _resolvedVersion: versionKey, _isFallbackVersion: isFallback };
+    }
+
+    if (entry && Array.isArray(entry.headers)) {
+      return { ...entry, _resolvedVersion: versionKey, _isFallbackVersion: isFallback };
+    }
+
+    return null;
+  };
+
   const toFriendlyLabel = (csvName = '') => {
     const base = csvName.replace(/\.csv$/i, '');
     if (!base) {
@@ -453,6 +624,87 @@ export default function CSVViewer() {
     const targetFolder = folder || default_folder;
     return buildObjectUrl(targetFolder, version, currentFileName);
   };
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const fetchCrosswalk = async () => {
+      const uniquePaths = new Set();
+      const addPath = (base, suffix) => {
+        if (!suffix) {
+          return;
+        }
+        const normalizedBase = base ? base.replace(/\/$/, '') : '';
+        const normalizedSuffix = suffix.startsWith('/') ? suffix : `/${suffix}`;
+        const candidate = `${normalizedBase}${normalizedSuffix}` || normalizedSuffix;
+        if (candidate) {
+          uniquePaths.add(candidate);
+        }
+      };
+
+      try {
+        const publicUrl = typeof process !== 'undefined'
+          ? (process.env?.PUBLIC_URL || '')
+          : '';
+
+        addPath('', '/data/header-crosswalk.json');
+        addPath('', 'data/header-crosswalk.json');
+        addPath(publicUrl, '/data/header-crosswalk.json');
+        addPath(publicUrl, 'data/header-crosswalk.json');
+
+        if (typeof window !== 'undefined') {
+          addPath(window.location.origin, '/data/header-crosswalk.json');
+          addPath(`${window.location.origin}${publicUrl}`, '/data/header-crosswalk.json');
+        }
+
+        let parsed = null;
+        let lastError = null;
+        for (const requestPath of uniquePaths) {
+          try {
+            const response = await fetch(requestPath, { cache: 'no-store' });
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status} ${response.statusText}`);
+            }
+
+            const contentType = response.headers.get('content-type') || '';
+            if (!contentType.includes('json')) {
+              const text = await response.clone().text();
+              if (/^\s*</.test(text)) {
+                throw new Error('Received non-JSON response (likely HTML).');
+              }
+              parsed = JSON.parse(text);
+            } else {
+              parsed = await response.json();
+            }
+
+            console.log('Loaded header crosswalk from', requestPath);
+            break;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+
+        if (!parsed) {
+          throw lastError || new Error('Unable to load header crosswalk map.');
+        }
+
+        if (isMounted) {
+          setHeaderCrosswalk(parsed);
+        }
+      } catch (err) {
+        console.error('Failed to load header crosswalk map', err);
+        if (isMounted) {
+          setHeaderCrosswalk((previous) => (previous && typeof previous === 'object' ? previous : null));
+        }
+      }
+    };
+
+    fetchCrosswalk();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -836,19 +1088,24 @@ export default function CSVViewer() {
 
           // Generate column placeholders based on the number of columns in the first row
           if (results.data[0] && Array.isArray(results.data[0])) {
-            const columnCount = results.data[0].length;
-            const placeholderHeaders = Array.from({ length: columnCount }, (_, i) => `Column ${i + 1}`);
-            setHeaders(placeholderHeaders);
+            const detectedCount = results.data[0].length;
+            setColumnCount(detectedCount);
+            if (!detectedCount) {
+              setError('Unable to determine column structure');
+            }
           } else {
+            setColumnCount(0);
             setError('Unable to determine column structure');
           }
         } else {
+          setColumnCount(0);
           setError('No rows found in the CSV file');
         }
         setLoading(false);
       },
       error: (error) => {
         setError(`Error parsing CSV: ${error.message}`);
+        setColumnCount(0);
         setLoading(false);
       }
     });
@@ -857,6 +1114,8 @@ export default function CSVViewer() {
   const fetchAndProcessCSV = async (url) => {
     setLoading(true);
     setError(null);
+    setColumnCount(0);
+    setHeaders([]);
     try {
       const response = await fetch(url);
 
@@ -906,6 +1165,7 @@ export default function CSVViewer() {
 
     } catch (err) {
       setError(`Error: ${err.message}`);
+      setColumnCount(0);
       setLoading(false);
     }
   };
@@ -1213,6 +1473,52 @@ export default function CSVViewer() {
     setTerminologyVersion(version);
     // The useEffect will automatically trigger and reload the current file with the new version
   };
+
+  useEffect(() => {
+    if (!columnCount) {
+      setHeaders((prev) => (prev.length ? [] : prev));
+      return;
+    }
+
+    const entry = resolveCrosswalkEntry(currentFileFolder, terminologyVersion, currentFileName);
+    const fallbackHeaders = Array.from({ length: columnCount }, () => null);
+
+    let nextHeaders = fallbackHeaders;
+
+    if (entry && Array.isArray(entry.headers)) {
+      if (entry.headers.length !== columnCount) {
+        console.warn('Crosswalk headers length mismatch', {
+          folder: currentFileFolder,
+          version: terminologyVersion,
+          file: currentFileName,
+          expected: columnCount,
+          received: entry.headers.length,
+          tag: entry.tag,
+          seed: entry.seed,
+        });
+      }
+
+      nextHeaders = fallbackHeaders.map((_, index) => {
+        const candidate = entry.headers[index];
+        if (candidate === null || candidate === undefined) {
+          return null;
+        }
+        const label = String(candidate).trim();
+        return label ? label : null;
+      });
+    }
+
+    console.log('Header resolution', {
+      folder: currentFileFolder,
+      version: terminologyVersion,
+      file: currentFileName,
+      columnCount,
+      hasEntry: Boolean(entry),
+      resolvedHeaders: nextHeaders,
+    });
+
+    setHeaders((prev) => (arraysEqual(prev, nextHeaders) ? prev : nextHeaders));
+  }, [columnCount, currentFileFolder, currentFileName, headerCrosswalk, terminologyVersion]);
 
   const normalizedSearch = searchTerm.trim().toLowerCase();
   const filteredGroups = fileGroups.filter((group) => {
