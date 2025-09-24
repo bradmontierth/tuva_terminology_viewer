@@ -2,8 +2,12 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { Search, Download, FileText, Loader2 } from 'lucide-react';
 import * as Papa from 'papaparse';
 import pako from 'pako';
+import limits from './config/limits.json';
 
 const MAX_INDEX_SEARCH_RESULTS = 500;
+const PARTIAL_PREVIEW_ROW_LIMIT = typeof limits?.partialPreviewRowLimit === 'number'
+  ? limits.partialPreviewRowLimit
+  : 50000;
 
 const tokenizeQuery = (value = '') => Array.from(new Set(
   value
@@ -205,6 +209,9 @@ export default function CSVViewer() {
   const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';
   const default_folder = 'versioned_terminology';
   const provider_folder = 'versioned_provider_data';
+  const INDEX_FOLDER_OVERRIDES = {
+    [default_folder]: 'terminology_indices',
+  };
 
   const [csvData, setCsvData] = useState([]);
   const [headers, setHeaders] = useState([]);
@@ -425,6 +432,18 @@ export default function CSVViewer() {
     const base = baseDomain.replace(/\/$/, '');
 
     return `${base}/${normalizedFolder}/${normalizedVersion}/${sanitizedFile}`;
+  };
+
+  const resolveIndexFolder = (folder) => {
+    if (!folder) {
+      return folder;
+    }
+    return INDEX_FOLDER_OVERRIDES[folder] || folder;
+  };
+
+  const buildIndexObjectUrl = (folder, version, fileName) => {
+    const indexFolder = resolveIndexFolder(folder);
+    return buildObjectUrl(indexFolder, version, fileName);
   };
 
   const getCurrentUrl = (version = terminologyVersion, folder = currentFileFolder) => {
@@ -806,7 +825,7 @@ export default function CSVViewer() {
       header: false,
       dynamicTyping: false, // Disable dynamic typing to preserve string values
       skipEmptyLines: true,
-      preview: shouldLimitRows ? 50000 : 0, // 0 means parse all rows
+      preview: shouldLimitRows ? PARTIAL_PREVIEW_ROW_LIMIT : 0, // 0 means parse all rows
       complete: (results) => {
         if (results.data && results.data.length > 0) {
           setCsvData(results.data);
@@ -1050,10 +1069,13 @@ export default function CSVViewer() {
 
     const targetFolder = currentFileFolder || default_folder;
     const cacheKey = `${targetFolder}::${terminologyVersion}::${baseCsvName.toLowerCase()}`;
-    const cached = indexCacheRef.current.get(cacheKey);
-
-    if (cached) {
-      setSearchIndex(cached);
+    if (indexCacheRef.current.has(cacheKey)) {
+      const cached = indexCacheRef.current.get(cacheKey);
+      if (cached) {
+        setSearchIndex(cached);
+      } else {
+        setSearchIndex(null);
+      }
       setIndexError(null);
       setIsLoadingIndex(false);
       return;
@@ -1070,7 +1092,7 @@ export default function CSVViewer() {
       let lastError = null;
 
       for (const candidate of candidates) {
-        const url = buildObjectUrl(targetFolder, terminologyVersion, candidate);
+        const url = buildIndexObjectUrl(targetFolder, terminologyVersion, candidate);
         if (!url) {
           continue;
         }
@@ -1079,7 +1101,9 @@ export default function CSVViewer() {
           const response = await fetch(url, { cache: 'no-store' });
           if (!response.ok) {
             if (response.status === 404) {
-              lastError = new Error(`Index file not found: ${candidate}`);
+              const notFoundError = new Error(`Index file not found: ${candidate}`);
+              notFoundError.code = 'INDEX_NOT_FOUND';
+              lastError = notFoundError;
               continue;
             }
             throw new Error(`Failed to fetch ${candidate}: ${response.status} ${response.statusText}`);
@@ -1130,6 +1154,13 @@ export default function CSVViewer() {
       })
       .catch((err) => {
         if (cancelled) {
+          return;
+        }
+        if (err && err.code === 'INDEX_NOT_FOUND') {
+          indexCacheRef.current.set(cacheKey, null);
+          console.info(`Search index not built for ${cacheKey}`);
+          setIndexError(null);
+          setSearchIndex(null);
           return;
         }
         console.warn(`Search index unavailable for ${cacheKey}`, err);

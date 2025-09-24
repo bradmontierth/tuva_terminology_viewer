@@ -4,6 +4,11 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 const Papa = require('papaparse');
+const limits = require('../src/config/limits.json');
+
+const DEFAULT_MIN_ROWS = limits && typeof limits.partialPreviewRowLimit === 'number'
+  ? limits.partialPreviewRowLimit
+  : 50000;
 
 const STOP_WORDS = new Set([
   'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'for',
@@ -162,7 +167,10 @@ function intersectSortedArrays(arrA, arrB) {
   return result;
 }
 
-async function buildIndexForGroup(rootDir, outputDir, groupKey, fileList) {
+async function buildIndexForGroup(rootDir, outputDir, groupKey, fileList, options = {}) {
+  const rowThreshold = typeof options.rowThreshold === 'number'
+    ? options.rowThreshold
+    : null;
   const dictionary = createDictionary();
   const rows = [];
   const rowFiles = [];
@@ -229,6 +237,16 @@ async function buildIndexForGroup(rootDir, outputDir, groupKey, fileList) {
     });
 
     totalRowCount += rowWithinFile;
+  }
+
+  if (rowThreshold !== null && totalRowCount <= rowThreshold) {
+    return {
+      skipped: true,
+      reason: 'row-count-below-threshold',
+      totalRows: totalRowCount,
+      filesProcessed: fileList.length,
+      rowThreshold,
+    };
   }
 
   const sortedTokens = Array.from(tokenToRows.keys()).sort((a, b) => a.localeCompare(b));
@@ -299,6 +317,16 @@ async function main() {
   const inputDir = args.input || args.i;
   const outputDir = args.output || args.o;
   const datasetFilter = args.dataset || args.d;
+  const minRowsArg = args['min-rows'] || args.minRows;
+
+  const minRowThreshold = minRowsArg !== undefined
+    ? Number(minRowsArg)
+    : DEFAULT_MIN_ROWS;
+
+  if (!Number.isFinite(minRowThreshold) || minRowThreshold < 0) {
+    console.error('Invalid value provided for --min-rows. Expected a non-negative number.');
+    process.exit(1);
+  }
 
   if (!inputDir) {
     console.error('Missing required --input argument');
@@ -330,13 +358,29 @@ async function main() {
   }
 
   console.log(`Found ${selectedGroups.length} dataset group(s) to process.`);
+  console.log(`Row threshold for indexing: ${minRowThreshold.toLocaleString()} rows.`);
 
   for (const group of selectedGroups) {
     const displayName = group.relativeDir ? `${group.relativeDir}/${group.baseName}` : group.baseName;
     console.log(`\nGenerating index for ${displayName} (${group.files.length} file(s))...`);
 
     try {
-      const stats = await buildIndexForGroup(resolvedInput, resolvedOutput, group, group.files);
+      const stats = await buildIndexForGroup(
+        resolvedInput,
+        resolvedOutput,
+        group,
+        group.files,
+        { rowThreshold: minRowThreshold },
+      );
+
+      if (stats && stats.skipped) {
+        const rowCountText = typeof stats.totalRows === 'number'
+          ? stats.totalRows.toLocaleString()
+          : 'unknown';
+        console.log(`  • Skipped (row count ${rowCountText} <= ${minRowThreshold.toLocaleString()})`);
+        continue;
+      }
+
       console.log(`  • Rows indexed: ${stats.totalRows}`);
       console.log(`  • Unique tokens: ${stats.tokens}`);
       console.log(`  • Dictionary entries: ${stats.dictionarySize}`);
