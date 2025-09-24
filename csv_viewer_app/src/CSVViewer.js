@@ -91,22 +91,41 @@ const buildIndexSearchResults = (query, searchIndex, limit = MAX_INDEX_SEARCH_RE
 
   for (const term of terms) {
     const tokenIndex = searchIndex.tokenLookup?.[term];
+    const directPostings = (typeof tokenIndex === 'number' && searchIndex.postings[tokenIndex])
+      ? searchIndex.postings[tokenIndex]
+      : null;
+
+    const shouldExpandPartials = !directPostings
+      || (term.length >= 3 && directPostings.length < limit);
+
     let termPostings;
 
-    if (typeof tokenIndex === 'number' && searchIndex.postings[tokenIndex]) {
-      termPostings = searchIndex.postings[tokenIndex];
-    } else {
-      const fallbackSet = new Set();
-      for (let i = 0; i < searchIndex.tokens.length; i += 1) {
-        if (searchIndex.tokens[i]?.includes(term)) {
-          const posting = searchIndex.postings[i];
-          for (let j = 0; j < posting.length; j += 1) {
-            fallbackSet.add(posting[j]);
-          }
+    if (shouldExpandPartials) {
+      const rowSet = new Set();
+
+      if (directPostings) {
+        for (let i = 0; i < directPostings.length; i += 1) {
+          rowSet.add(directPostings[i]);
         }
       }
 
-      if (!fallbackSet.size) {
+      for (let i = 0; i < searchIndex.tokens.length; i += 1) {
+        const token = searchIndex.tokens[i];
+        if (!token || !token.includes(term)) {
+          continue;
+        }
+
+        if (directPostings && typeof tokenIndex === 'number' && i === tokenIndex) {
+          continue;
+        }
+
+        const posting = searchIndex.postings[i];
+        for (let j = 0; j < posting.length; j += 1) {
+          rowSet.add(posting[j]);
+        }
+      }
+
+      if (!rowSet.size) {
         return {
           rows: [],
           matchCount: 0,
@@ -114,7 +133,9 @@ const buildIndexSearchResults = (query, searchIndex, limit = MAX_INDEX_SEARCH_RE
         };
       }
 
-      termPostings = Array.from(fallbackSet).sort((a, b) => a - b);
+      termPostings = Array.from(rowSet).sort((a, b) => a - b);
+    } else {
+      termPostings = directPostings;
     }
 
     if (!termPostings || !termPostings.length) {
@@ -177,6 +198,8 @@ const buildIndexSearchResults = (query, searchIndex, limit = MAX_INDEX_SEARCH_RE
     truncated: candidateRows.length > matches.length,
   };
 };
+
+export { buildIndexSearchResults };
 
 export default function CSVViewer() {
   const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';

@@ -2,7 +2,7 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 
 module.exports = function (app) {
   const proxy = createProxyMiddleware({
-    target: 'https://tuva-public-resources.s3.amazonaws.com',
+    target: 'http://localhost:9000',
     changeOrigin: true,
     pathRewrite: {
       '^/s3-proxy': '',

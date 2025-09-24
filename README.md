@@ -42,3 +42,13 @@ node scripts/build-index.js --input <folder-with-csvs> --output <folder-for-inde
 Each run groups multi-part files such as `admit_source.csv_0.csv.gz`, `admit_source.csv_1.csv.gz`, etc., records row metadata, and writes an inverted token index that the frontend loads on demand.
 
 After publishing the generated `.index.json.gz` files alongside their CSV counterparts, the GitHub Pages build will automatically pick them up and route search queries through the new index-backed flow.
+
+### Testing indexes locally
+
+1. Serve the downloaded datasets from a static server (for example, `npx http-server data -p 9000 --cors`).
+2. Launch the app with the data base override so browser requests hit your local server:
+   ```bash
+   REACT_APP_DATA_BASE_URL=http://localhost:9000 \
+   npm start
+   ```
+3. Keep `REACT_APP_USE_S3_PROXY=true` if you still want the listings to come through the proxy; object fetches will now come from your local cache, allowing you to verify the generated index files before pushing them to S3.
