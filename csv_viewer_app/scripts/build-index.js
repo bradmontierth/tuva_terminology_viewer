@@ -18,9 +18,31 @@ const HEADER_SIZE = 112;
 const TYPE_UINT16 = 1;
 const TYPE_UINT32 = 2;
 const JSON_ROW_THRESHOLD = 200000;
-const MAX_INDEX_VALUE_COLUMNS = typeof limits?.indexValueColumnLimit === 'number'
+const DEFAULT_INDEX_VALUE_COLUMN_LIMIT = typeof limits?.indexValueColumnLimit === 'number'
   ? Math.max(0, Math.floor(limits.indexValueColumnLimit))
   : 8;
+
+const INDEX_VALUE_COLUMN_OVERRIDES = limits && typeof limits === 'object'
+  ? limits.indexValueColumnLimitOverrides || {}
+  : {};
+
+const INDEX_DATASET_EXCLUSIONS = new Set(
+  Array.isArray(limits?.indexDatasetExclusions)
+    ? limits.indexDatasetExclusions
+        .map((name) => (typeof name === 'string' ? name.trim().toLowerCase() : ''))
+        .filter(Boolean)
+    : [],
+);
+
+const resolveValueColumnLimit = (datasetName = '') => {
+  if (datasetName && typeof INDEX_VALUE_COLUMN_OVERRIDES === 'object') {
+    const override = INDEX_VALUE_COLUMN_OVERRIDES[datasetName];
+    if (Number.isFinite(override) && override >= 0) {
+      return Math.floor(override);
+    }
+  }
+  return DEFAULT_INDEX_VALUE_COLUMN_LIMIT;
+};
 const MAX_IN_MEMORY_POSTING_PAIRS = 1000000;
 
 const ensureDirectoryRemoved = async (targetPath) => {
@@ -623,6 +645,10 @@ async function walkDirectory(rootDir) {
         continue;
       }
 
+      if (/[_-]compressed\.csv(\.gz)?$/i.test(entry.name)) {
+        continue;
+      }
+
       result.push(relativePath);
     }
   }
@@ -734,6 +760,7 @@ async function buildIndexForGroup(rootDir, outputDir, groupKey, fileList, option
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'tuva-index-chunks-'));
   const postingsAccumulator = new PostingAccumulator(tempDir, { maxPairs: MAX_IN_MEMORY_POSTING_PAIRS });
   let tokenFlushChain = Promise.resolve();
+  const valueColumnLimit = resolveValueColumnLimit(groupKey?.baseName);
 
   try {
     for (let fileIndex = 0; fileIndex < fileList.length; fileIndex += 1) {
@@ -769,8 +796,8 @@ async function buildIndexForGroup(rootDir, outputDir, groupKey, fileList, option
 
           const rowIndex = totalRowCount;
           const tokens = extractTokensFromRow(normalizedRow);
-          const storedRow = MAX_INDEX_VALUE_COLUMNS > 0
-            ? normalizedRow.slice(0, MAX_INDEX_VALUE_COLUMNS)
+          const storedRow = valueColumnLimit > 0
+            ? normalizedRow.slice(0, valueColumnLimit)
             : normalizedRow;
           if (!truncatedColumnDetected && storedRow.length < normalizedRow.length) {
             truncatedColumnDetected = true;
@@ -919,7 +946,7 @@ async function buildIndexForGroup(rootDir, outputDir, groupKey, fileList, option
       totalCells: rowData.length,
       totalEntries: postingsData.length,
       postingsForJson,
-      valueColumnLimit: MAX_INDEX_VALUE_COLUMNS,
+      valueColumnLimit,
     };
 
     const baseOutputPath = path.join(outputDir, groupKey.relativeDir, `${groupKey.baseName}.index`);
@@ -931,7 +958,7 @@ async function buildIndexForGroup(rootDir, outputDir, groupKey, fileList, option
     });
 
     if (truncatedColumnDetected) {
-      console.warn(`  • Index row values limited to first ${MAX_INDEX_VALUE_COLUMNS} column(s)`);
+      console.warn(`  • Index row values limited to first ${valueColumnLimit} column(s)`);
     }
 
     return {
@@ -1025,6 +1052,12 @@ async function main() {
 
   for (const group of selectedGroups) {
     const displayName = group.relativeDir ? `${group.relativeDir}/${group.baseName}` : group.baseName;
+
+    if (INDEX_DATASET_EXCLUSIONS.has((group.baseName || '').toLowerCase())) {
+      console.log(`\nSkipping ${displayName} (dataset excluded from indexing).`);
+      continue;
+    }
+
     console.log(`\nGenerating index for ${displayName} (${group.files.length} file(s))...`);
 
     try {

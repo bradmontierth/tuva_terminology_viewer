@@ -1542,6 +1542,15 @@ export default function CSVViewer() {
             relative = relative.slice(prefixBase.length);
           }
           relative = relative.trim();
+          if (!relative) {
+            return;
+          }
+          if (/[_-]compressed\.csv(\.gz)?$/i.test(relative)) {
+            return;
+          }
+          if (/[_-]compressed\.zip$/i.test(relative)) {
+            return;
+          }
           if (relative) {
             files.push(relative);
           }
@@ -2598,16 +2607,6 @@ export default function CSVViewer() {
                   Showing first {MAX_INDEX_SEARCH_RESULTS.toLocaleString()} matches. Refine the search to narrow results.
                 </div>
               )}
-              {!searchIndex && !isLoadingIndex && !indexError && (
-                <div style={{
-                  fontSize: '12px',
-                  color: '#6b7280',
-                  marginBottom: '12px'
-                }}>
-                  Search is limited to the preview because no pre-built index was found for this dataset.
-                </div>
-              )}
-
               <div style={{
                 overflowY: 'auto',
                 flexGrow: 1

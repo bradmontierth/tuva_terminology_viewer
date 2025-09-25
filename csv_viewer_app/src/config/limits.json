@@ -1,3 +1,11 @@
 {
-  "partialPreviewRowLimit": 50000
+  "partialPreviewRowLimit": 1000,
+  "indexValueColumnLimit": 8,
+  "indexValueColumnLimitOverrides": {
+    "provider.csv": 4
+  },
+  "indexDatasetExclusions": [
+    "provider.csv",
+    "other_provider_taxonomy.csv"
+  ]
 }
