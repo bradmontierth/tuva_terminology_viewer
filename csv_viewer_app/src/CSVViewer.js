@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Search, Download, FileText, Loader2 } from 'lucide-react';
 import * as Papa from 'papaparse';
 import pako from 'pako';
+import JSZip from 'jszip';
 import limits from './config/limits.json';
 import headerCrosswalkFallback from './generated/headerCrosswalk.json';
 
@@ -230,13 +231,102 @@ const arraysEqual = (a = [], b = []) => {
   return true;
 };
 
+const CSV_TEXT_LIMIT = 5000000; // 5MB of text before limiting rows
+
+const isZipFileName = (fileName = '') => fileName.toLowerCase().endsWith('.zip');
+
+const hasZipSignature = (arrayBuffer) => {
+  const bytes = new Uint8Array(arrayBuffer.slice(0, 4));
+  if (bytes.length < 4) {
+    return false;
+  }
+  const matchesPK = bytes[0] === 0x50 && bytes[1] === 0x4b;
+  if (!matchesPK) {
+    return false;
+  }
+  return [0x03, 0x05, 0x07].includes(bytes[2]) && [0x04, 0x06, 0x08].includes(bytes[3]);
+};
+
+const extractCsvFromZip = async (arrayBuffer, preferredName = '') => {
+  const zip = await JSZip.loadAsync(arrayBuffer);
+  const entries = Object.values(zip.files).filter((entry) => !entry.dir);
+
+  if (!entries.length) {
+    throw new Error('ZIP archive has no files');
+  }
+
+  const csvEntries = entries.filter((entry) => entry.name.toLowerCase().endsWith('.csv'));
+  if (!csvEntries.length) {
+    throw new Error('ZIP archive does not contain CSV files');
+  }
+
+  const preferredBase = preferredName.replace(/\.zip$/i, '').toLowerCase();
+  const matchedEntry = preferredBase
+    ? csvEntries.find((entry) => entry.name.toLowerCase().includes(preferredBase))
+    : null;
+
+  const targetEntry = matchedEntry || csvEntries[0];
+  const csvString = await targetEntry.async('string');
+  return { csvString, entryName: targetEntry.name };
+};
+
 export default function CSVViewer() {
   const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';
   const default_folder = 'versioned_terminology';
   const provider_folder = 'versioned_provider_data';
-  const INDEX_FOLDER_OVERRIDES = {
-    [default_folder]: 'terminology_indices',
-  };
+  const value_sets_folder = 'versioned_value_sets';
+  const reference_data_folder = 'reference-data';
+
+  const dataCategories = useMemo(() => ([
+    {
+      id: 'terminology',
+      label: 'Terminology',
+      versionLabel: 'Terminology version',
+      sources: [
+        { folder: default_folder, type: 'versioned', indexFolder: 'terminology_indices' },
+        { folder: provider_folder, type: 'versioned', indexFolder: 'provider_indices' }
+      ]
+    },
+    {
+      id: 'value-sets',
+      label: 'Value Sets',
+      versionLabel: 'Value set version',
+      sources: [
+        { folder: value_sets_folder, type: 'versioned', indexFolder: 'value_set_indices' }
+      ]
+    },
+    {
+      id: 'reference-data',
+      label: 'Reference Data',
+      versionLabel: null,
+      sources: [
+        {
+          folder: reference_data_folder,
+          type: 'unversioned',
+          excludedPrefixes: [`${reference_data_folder}/2022 Census Shapefiles/`],
+          indexFolder: 'reference_data_indices'
+        }
+      ]
+    }
+  ]), [default_folder, provider_folder, value_sets_folder, reference_data_folder]);
+
+  const versionedFolders = useMemo(() => new Set(
+    dataCategories.flatMap((category) =>
+      category.sources.filter((source) => source.type === 'versioned').map((source) => source.folder)
+    )
+  ), [dataCategories]);
+
+  const indexFolderMap = useMemo(() => {
+    const map = new Map();
+    dataCategories.forEach((category) => {
+      category.sources.forEach((source) => {
+        if (source.indexFolder) {
+          map.set(source.folder, source.indexFolder);
+        }
+      });
+    });
+    return map;
+  }, [dataCategories]);
 
   const [csvData, setCsvData] = useState([]);
   const [columnCount, setColumnCount] = useState(0);
@@ -260,6 +350,7 @@ export default function CSVViewer() {
   const [isPartialData, setIsPartialData] = useState(false);
   const [terminologyVersion, setTerminologyVersion] = useState(null);
   const [terminologyVersions, setTerminologyVersions] = useState([]);
+  const [activeCategoryId, setActiveCategoryId] = useState(dataCategories[0].id);
   const [isLoadingVersions, setIsLoadingVersions] = useState(false);
   const [versionLoadError, setVersionLoadError] = useState(null);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
@@ -271,7 +362,33 @@ export default function CSVViewer() {
   const [isLoadingIndex, setIsLoadingIndex] = useState(false);
   const [indexError, setIndexError] = useState(null);
 
-  const determineListingBase = () => {
+  const activeCategory = useMemo(
+    () => dataCategories.find((category) => category.id === activeCategoryId) || dataCategories[0],
+    [dataCategories, activeCategoryId]
+  );
+  const versionedSources = useMemo(
+    () => activeCategory.sources.filter((source) => source.type === 'versioned'),
+    [activeCategory]
+  );
+  const hasVersionedSources = versionedSources.length > 0;
+
+  useEffect(() => {
+    setFileGroups([]);
+    setSelectedGroupId(null);
+    setCurrentFileName(null);
+    setCurrentFileFolder(activeCategory.sources[0]?.folder || default_folder);
+    setCsvData([]);
+    setHeaders([]);
+    setSearchTerm('');
+    setFilterTerm('');
+    setCurrentPage(1);
+    setIsPartialData(false);
+    setError(null);
+    setFileLoadError(null);
+    setLoading(false);
+  }, [activeCategory]);
+
+  const determineListingBase = useCallback(() => {
     if (typeof window === 'undefined') {
       return baseDomain;
     }
@@ -292,20 +409,21 @@ export default function CSVViewer() {
     ].includes(hostname);
 
     return isLocalHost ? '/s3-proxy' : baseDomain;
-  };
+  }, [baseDomain]);
 
-  const getListingBase = () => {
+  const getListingBase = useCallback(() => {
     if (!listingBaseRef.current) {
       listingBaseRef.current = determineListingBase();
     }
     return listingBaseRef.current;
-  };
+  }, [determineListingBase]);
 
-  const setListingBase = (value) => {
+  const setListingBase = useCallback((value) => {
     listingBaseRef.current = value;
-  };
+  }, []);
 
-  const buildListingUrl = (folder, params, base = getListingBase()) => {
+  const buildListingUrl = useCallback((folder, params, baseOverride) => {
+    const base = baseOverride ?? getListingBase();
     if (base === '/s3-proxy') {
       return `${base}/?${params}`;
     }
@@ -314,7 +432,7 @@ export default function CSVViewer() {
     const url = new URL(baseUrl);
     url.search = params;
     return url.toString();
-  };
+  }, [getListingBase]);
 
   const getElementsByTag = (context, tag) => {
     if (!context) {
@@ -361,7 +479,7 @@ export default function CSVViewer() {
     return [];
   };
 
-  const toBaseCsvName = (fileName = '') => {
+  const toBaseCsvName = useCallback((fileName = '') => {
     const normalized = fileName.trim();
     if (!normalized) {
       return '';
@@ -376,12 +494,16 @@ export default function CSVViewer() {
       return normalized.replace(/\.csv\.gz$/i, '.csv');
     }
 
+    if (normalized.endsWith('.zip')) {
+      return normalized.replace(/\.zip$/i, '.csv');
+    }
+
     return normalized;
-  };
+  }, []);
 
-  const isLatestVersion = (value = '') => normalizeKey(value) === 'latest';
+  const isLatestVersion = useCallback((value = '') => normalizeKey(value) === 'latest', []);
 
-  const toVersionParts = (value = '') => {
+  const toVersionParts = useCallback((value = '') => {
     if (!value) {
       return [];
     }
@@ -394,9 +516,9 @@ export default function CSVViewer() {
         const numeric = Number(part);
         return Number.isNaN(numeric) ? part.toLowerCase() : numeric;
       });
-  };
+  }, []);
 
-  const compareVersionStrings = (a = '', b = '') => {
+  const compareVersionStrings = useCallback((a = '', b = '') => {
     if (isLatestVersion(a) && isLatestVersion(b)) {
       return 0;
     }
@@ -407,42 +529,28 @@ export default function CSVViewer() {
       return -1;
     }
 
-    const aParts = toVersionParts(a);
-    const bParts = toVersionParts(b);
-    const maxLength = Math.max(aParts.length, bParts.length);
-
+    const partsA = toVersionParts(a);
+    const partsB = toVersionParts(b);
+    const maxLength = Math.max(partsA.length, partsB.length);
     for (let index = 0; index < maxLength; index += 1) {
-      const aPart = aParts[index] ?? 0;
-      const bPart = bParts[index] ?? 0;
+      const valueA = index < partsA.length ? partsA[index] : 0;
+      const valueB = index < partsB.length ? partsB[index] : 0;
 
-      if (aPart === bPart) {
+      if (valueA === valueB) {
         continue;
       }
 
-      if (typeof aPart === 'string' || typeof bPart === 'string') {
-        const aString = String(aPart);
-        const bString = String(bPart);
-        if (aString > bString) {
-          return 1;
-        }
-        if (aString < bString) {
-          return -1;
-        }
-        continue;
+      if (typeof valueA === 'number' && typeof valueB === 'number') {
+        return valueA < valueB ? -1 : 1;
       }
 
-      if (aPart > bPart) {
-        return 1;
-      }
-      if (aPart < bPart) {
-        return -1;
-      }
+      return String(valueA).localeCompare(String(valueB), undefined, { sensitivity: 'base' });
     }
 
     return 0;
-  };
+  }, [isLatestVersion, toVersionParts]);
 
-  const resolveVersionMap = (folderMap, requestedVersion) => {
+  const resolveVersionMap = useCallback((folderMap, requestedVersion) => {
     if (!folderMap || typeof folderMap !== 'object') {
       return null;
     }
@@ -475,9 +583,29 @@ export default function CSVViewer() {
     }
 
     return { versionKey: bestKey, map, isFallback: bestKey !== normalizedRequested };
-  };
+  }, [compareVersionStrings]);
 
-  const resolveCrosswalkEntry = (folder, version, fileName) => {
+  const toFriendlyLabel = useCallback((csvName = '') => {
+    const base = csvName.replace(/\.csv$/i, '');
+    if (!base) {
+      return csvName;
+    }
+
+    return base
+      .split(/[_-]+/)
+      .filter(Boolean)
+      .map((word) => {
+        if (/^[a-z0-9]+$/i.test(word) && word.length <= 3) {
+          return word.toUpperCase();
+        }
+        return word.charAt(0).toUpperCase() + word.slice(1);
+      })
+      .join(' ');
+  }, []);
+
+  const createGroupId = useCallback((folder, csvName) => `${folder}::${csvName.toLowerCase()}`, []);
+
+  const resolveCrosswalkEntry = useCallback((folder, version, fileName) => {
     if (!headerCrosswalk || typeof headerCrosswalk !== 'object') {
       return null;
     }
@@ -516,35 +644,15 @@ export default function CSVViewer() {
     }
 
     return null;
-  };
-
-  const toFriendlyLabel = (csvName = '') => {
-    const base = csvName.replace(/\.csv$/i, '');
-    if (!base) {
-      return csvName;
-    }
-
-    return base
-      .split(/[_-]+/)
-      .filter(Boolean)
-      .map((word) => {
-        if (/^[a-z0-9]+$/i.test(word) && word.length <= 3) {
-          return word.toUpperCase();
-        }
-        return word.charAt(0).toUpperCase() + word.slice(1);
-      })
-      .join(' ');
-  };
-
-  const createGroupId = (folder, csvName) => `${folder}::${csvName.toLowerCase()}`;
+  }, [headerCrosswalk, resolveVersionMap, toBaseCsvName]);
 
 
   const baseCsvName = useMemo(
     () => (currentFileName ? toBaseCsvName(currentFileName) : null),
-    [currentFileName]
+    [currentFileName, toBaseCsvName]
   );
 
-  const buildFileGroups = (fileEntries) => {
+  const buildFileGroups = useCallback((fileEntries) => {
     const groups = new Map();
 
     fileEntries.forEach(({ folder, fileName }) => {
@@ -584,46 +692,53 @@ export default function CSVViewer() {
     });
 
     return sortedGroups;
-  };
-  // Generate the current URL based on filename and version
-  const buildObjectUrl = (folder, version, fileName) => {
-    if (!folder || !version || !fileName) {
-      return '';
-    }
-
-    const normalizedFolder = folder
-      .replace(/\\/g, '/')
-      .replace(/^\/+|\/+$/g, '');
-
-    const normalizedVersion = String(version)
-      .trim()
-      .replace(/^\/+|\/+$/g, '');
-
-    const sanitizedFile = fileName.replace(/^\/+/, '');
-    const base = baseDomain.replace(/\/$/, '');
-
-    return `${base}/${normalizedFolder}/${normalizedVersion}/${sanitizedFile}`;
-  };
-
-  const resolveIndexFolder = (folder) => {
+  }, [createGroupId, toBaseCsvName, toFriendlyLabel, default_folder]);
+  // Generate S3 object URLs for data and index assets
+  const resolveIndexFolder = useCallback((folder) => {
     if (!folder) {
       return folder;
     }
-    return INDEX_FOLDER_OVERRIDES[folder] || folder;
-  };
+    return indexFolderMap.get(folder) || folder;
+  }, [indexFolderMap]);
 
-  const buildIndexObjectUrl = (folder, version, fileName) => {
-    const indexFolder = resolveIndexFolder(folder);
-    return buildObjectUrl(indexFolder, version, fileName);
-  };
-
-  const getCurrentUrl = (version = terminologyVersion, folder = currentFileFolder) => {
-    if (!version || !currentFileName) {
+  const buildObjectUrl = useCallback((folder, fileName, version, { useIndexFolder = false } = {}) => {
+    if (!folder || !fileName) {
       return '';
     }
+
+    const targetFolder = useIndexFolder ? resolveIndexFolder(folder) : folder;
+    if (!targetFolder) {
+      return '';
+    }
+
+    const normalizedFolder = targetFolder
+      .replace(/\\/g, '/')
+      .replace(/^\/+|\/+$/g, '');
+    const sanitizedFile = fileName.replace(/^\/+/, '');
+    const base = baseDomain.replace(/\/$/, '');
+
+    if (versionedFolders.has(folder)) {
+      const normalizedVersion = (version ?? '')
+        .toString()
+        .trim()
+        .replace(/^\/+|\/+$/g, '');
+      if (!normalizedVersion) {
+        return '';
+      }
+      return `${base}/${normalizedFolder}/${normalizedVersion}/${sanitizedFile}`;
+    }
+
+    return `${base}/${normalizedFolder}/${sanitizedFile}`;
+  }, [baseDomain, resolveIndexFolder, versionedFolders]);
+
+  const getCurrentUrl = useCallback((
+    version = terminologyVersion,
+    folder = currentFileFolder,
+    fileName = currentFileName
+  ) => {
     const targetFolder = folder || default_folder;
-    return buildObjectUrl(targetFolder, version, currentFileName);
-  };
+    return buildObjectUrl(targetFolder, fileName, version);
+  }, [buildObjectUrl, currentFileFolder, currentFileName, default_folder, terminologyVersion]);
 
   useEffect(() => {
     let isMounted = true;
@@ -708,6 +823,20 @@ export default function CSVViewer() {
 
   useEffect(() => {
     let isMounted = true;
+
+    userSelectedVersionRef.current = false;
+    setTerminologyVersion(null);
+    setTerminologyVersions([]);
+    setVersionLoadError(null);
+
+    if (!versionedSources.length) {
+      setIsLoadingVersions(false);
+      return () => {
+        isMounted = false;
+      };
+    }
+
+    setIsLoadingVersions(true);
 
     let listingBase = getListingBase();
 
@@ -796,10 +925,10 @@ export default function CSVViewer() {
         const contentType = response.headers.get('content-type') || '';
         if (!contentType.includes('xml') && /^\s*<!doctype\s+html/i.test(xmlText)) {
           if (listingBase !== baseDomain) {
-          listingBase = baseDomain;
-          setListingBase(baseDomain);
-          continue;
-        }
+            listingBase = baseDomain;
+            setListingBase(baseDomain);
+            continue;
+          }
           throw new Error('Received HTML instead of XML when listing versions.');
         }
 
@@ -838,19 +967,17 @@ export default function CSVViewer() {
 
     const loadAvailableVersions = async () => {
       setIsLoadingVersions(true);
-      setVersionLoadError(null);
 
       try {
-        const [terminologyList, providerList] = await Promise.all([
-          fetchVersionsForFolder(default_folder),
-          fetchVersionsForFolder(provider_folder)
-        ]);
+        const versionLists = await Promise.all(
+          versionedSources.map((source) => fetchVersionsForFolder(source.folder))
+        );
 
         if (!isMounted) {
           return;
         }
 
-        const uniqueVersions = Array.from(new Set([...terminologyList, ...providerList])).filter(Boolean);
+        const uniqueVersions = Array.from(new Set(versionLists.flat())).filter(Boolean);
 
         const normalizeForSort = (value) => value.replace(/_/g, '.');
         const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
@@ -896,14 +1023,14 @@ export default function CSVViewer() {
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [activeCategory, buildListingUrl, getListingBase, setListingBase, versionedSources]);
 
   useEffect(() => {
-    if (!terminologyVersion) {
+    if (hasVersionedSources && !terminologyVersion) {
       setFileGroups([]);
       setSelectedGroupId(null);
       setCurrentFileName(null);
-      setCurrentFileFolder(default_folder);
+      setCurrentFileFolder(versionedSources[0]?.folder || activeCategory.sources[0]?.folder || default_folder);
       setIsLoadingFiles(false);
       setFileLoadError(null);
       return;
@@ -915,25 +1042,30 @@ export default function CSVViewer() {
     setFileGroups([]);
     setSelectedGroupId(null);
     setCurrentFileName(null);
-    setCurrentFileFolder(default_folder);
+    setCurrentFileFolder(activeCategory.sources[0]?.folder || default_folder);
 
     let listingBase = getListingBase();
 
-    const fetchFilesForFolder = async (folder) => {
+    const fetchFilesForSource = async (source) => {
       const files = [];
       let continuationToken = null;
+      const isVersioned = source.type === 'versioned';
+      const excludedPrefixes = Array.isArray(source.excludedPrefixes) ? source.excludedPrefixes : [];
+      const prefixBase = isVersioned
+        ? `${source.folder}/${terminologyVersion}/`
+        : `${source.folder}/`;
 
       do {
         const params = new URLSearchParams({
           'list-type': '2',
-          prefix: `${folder}/${terminologyVersion}/`,
+          prefix: prefixBase,
         });
 
         if (continuationToken) {
           params.append('continuation-token', continuationToken);
         }
 
-        const url = buildListingUrl(folder, params.toString(), listingBase);
+        const url = buildListingUrl(source.folder, params.toString(), listingBase);
         const requestOptions = {
           cache: 'no-store',
           headers: {
@@ -948,7 +1080,7 @@ export default function CSVViewer() {
         }
 
         if (!response.ok) {
-          throw new Error(`Failed to list files for ${folder}: ${response.status} ${response.statusText}`);
+          throw new Error(`Failed to list files for ${source.folder}: ${response.status} ${response.statusText}`);
         }
 
         if (typeof DOMParser === 'undefined') {
@@ -992,7 +1124,14 @@ export default function CSVViewer() {
           if (!keyText || keyText.endsWith('/')) {
             return;
           }
-          const relative = keyText.replace(`${folder}/${terminologyVersion}/`, '').trim();
+          if (excludedPrefixes.some((prefix) => keyText.startsWith(prefix))) {
+            return;
+          }
+          let relative = keyText;
+          if (relative.startsWith(prefixBase)) {
+            relative = relative.slice(prefixBase.length);
+          }
+          relative = relative.trim();
           if (relative) {
             files.push(relative);
           }
@@ -1007,24 +1146,27 @@ export default function CSVViewer() {
       return files;
     };
 
-    const loadFilesForVersion = async () => {
+    const loadFilesForSelection = async () => {
       try {
-        const [terminologyFiles, providerFiles] = await Promise.all([
-          fetchFilesForFolder(default_folder),
-          fetchFilesForFolder(provider_folder).catch((err) => {
-            console.warn('Failed to load provider files from S3', err);
-            return [];
-          }),
-        ]);
+        const fileLists = await Promise.all(
+          activeCategory.sources.map((source) => {
+            if (source.type === 'versioned' && !terminologyVersion) {
+              return [];
+            }
+            return fetchFilesForSource(source).catch((err) => {
+              console.warn(`Failed to load files from S3 for ${source.folder}`, err);
+              return [];
+            });
+          })
+        );
 
         if (!isMounted) {
           return;
         }
 
-        const entries = [
-          ...terminologyFiles.map((fileName) => ({ folder: default_folder, fileName })),
-          ...providerFiles.map((fileName) => ({ folder: provider_folder, fileName })),
-        ];
+        const entries = activeCategory.sources.flatMap((source, index) =>
+          fileLists[index].map((fileName) => ({ folder: source.folder, fileName }))
+        );
 
         const groups = buildFileGroups(entries);
 
@@ -1033,7 +1175,7 @@ export default function CSVViewer() {
         if (!groups.length) {
           setSelectedGroupId(null);
           setCurrentFileName(null);
-          setCurrentFileFolder(default_folder);
+          setCurrentFileFolder(activeCategory.sources[0]?.folder || default_folder);
           return;
         }
 
@@ -1042,13 +1184,13 @@ export default function CSVViewer() {
         setCurrentFileName(firstGroup.files[0] || null);
         setCurrentFileFolder(firstGroup.folder);
       } catch (err) {
-        console.error('Failed to load terminology files from S3', err);
+        console.error('Failed to load files from S3', err);
         if (isMounted) {
-          setFileLoadError('Unable to load file listing for this version.');
+          setFileLoadError('Unable to load file listing for this selection.');
           setFileGroups([]);
           setSelectedGroupId(null);
           setCurrentFileName(null);
-          setCurrentFileFolder(default_folder);
+          setCurrentFileFolder(activeCategory.sources[0]?.folder || default_folder);
         }
       } finally {
         if (isMounted) {
@@ -1057,15 +1199,15 @@ export default function CSVViewer() {
       }
     };
 
-    loadFilesForVersion();
+    loadFilesForSelection();
 
     return () => {
       isMounted = false;
     };
-  }, [terminologyVersion]);
+  }, [activeCategory, buildFileGroups, buildListingUrl, getListingBase, hasVersionedSources, setListingBase, terminologyVersion, versionedSources]);
 
   // Helper function to process CSV string and update state
-  const processCsvString = (csvString, isPartial = false, forceLimit = false) => {
+  const processCsvString = useCallback((csvString, isPartial = false, forceLimit = false) => {
     if (!csvString.trim()) {
       throw new Error("CSV file is empty");
     }
@@ -1089,10 +1231,9 @@ export default function CSVViewer() {
           // Generate column placeholders based on the number of columns in the first row
           if (results.data[0] && Array.isArray(results.data[0])) {
             const detectedCount = results.data[0].length;
+            const placeholderHeaders = Array.from({ length: detectedCount }, (_, i) => `Column ${i + 1}`);
             setColumnCount(detectedCount);
-            if (!detectedCount) {
-              setError('Unable to determine column structure');
-            }
+            setHeaders(placeholderHeaders);
           } else {
             setColumnCount(0);
             setError('Unable to determine column structure');
@@ -1109,69 +1250,10 @@ export default function CSVViewer() {
         setLoading(false);
       }
     });
-  };
-
-  const fetchAndProcessCSV = async (url) => {
-    setLoading(true);
-    setError(null);
-    setColumnCount(0);
-    setHeaders([]);
-    try {
-      const response = await fetch(url);
-
-      if (!response.ok) {
-        throw new Error(`Failed to fetch data: ${response.status} ${response.statusText} (${url})`);
-      }
-
-      // Get the data as ArrayBuffer
-      const arrayBuffer = await response.arrayBuffer();
-      const fileSizeBytes = arrayBuffer.byteLength;
-
-      // First try to decompress assuming it's gzipped
-      try {
-        const decompressed = pako.inflate(new Uint8Array(arrayBuffer));
-        const decoder = new TextDecoder('utf-8');
-        const csvString = decoder.decode(decompressed);
-
-        // Check if we should limit parsing due to large decompressed size
-        const shouldLimit = csvString.length > 5000000; // 5MB of text
-
-        // Process the decompressed CSV
-        processCsvString(csvString, false, shouldLimit);
-
-      } catch (decompressionError) {
-        console.log("Decompression failed, trying to read as plain text CSV", decompressionError);
-
-        // If decompression fails, try to read as plain text CSV
-        try {
-          const decoder = new TextDecoder('utf-8');
-          const csvString = decoder.decode(arrayBuffer);
-
-          // Check if it looks like a CSV (has commas or typical CSV structure)
-          if (csvString.includes(',') || csvString.includes('\n')) {
-            // For uncompressed files, check if we should limit based on size
-            const shouldLimit = fileSizeBytes > 5000000; // 5MB file size
-            processCsvString(csvString, false, shouldLimit);
-          } else {
-            throw new Error("File doesn't appear to be a valid CSV or compressed CSV");
-          }
-
-        } catch (textReadError) {
-          console.error("Failed to read as plain text CSV", textReadError);
-          // If both decompression and plain text reading fail, try partial fetch
-          await fetchPartialCSV(url);
-        }
-      }
-
-    } catch (err) {
-      setError(`Error: ${err.message}`);
-      setColumnCount(0);
-      setLoading(false);
-    }
-  };
+  }, []);
 
   // Function to fetch just a portion of a large file
-  const fetchPartialCSV = async (url) => {
+  const fetchPartialCSV = useCallback(async (url) => {
     try {
       // Fetch with range header to get just the start of the file
       const response = await fetch(url, {
@@ -1219,116 +1301,109 @@ export default function CSVViewer() {
       setError(`Error fetching partial data: ${err.message}`);
       setLoading(false);
     }
-  };
+  }, [processCsvString]);
+
+  const fetchAndProcessCSV = useCallback(async (url, fileName = '') => {
+    setLoading(true);
+    setError(null);
+    setIndexError(null);
+    setSearchIndex(null);
+    setColumnCount(0);
+    setHeaders([]);
+    try {
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(`Failed to fetch data: ${response.status} ${response.statusText} (${url})`);
+      }
+
+      // Get the data as ArrayBuffer
+      const arrayBuffer = await response.arrayBuffer();
+      const fileSizeBytes = arrayBuffer.byteLength;
+
+      const zipLikely = isZipFileName(fileName) || hasZipSignature(arrayBuffer);
+      if (zipLikely) {
+        try {
+          const { csvString } = await extractCsvFromZip(arrayBuffer, fileName);
+          const shouldLimit = csvString.length > CSV_TEXT_LIMIT; // 5MB of text
+          processCsvString(csvString, false, shouldLimit);
+          return;
+        } catch (zipError) {
+          setError(`Unable to extract ZIP archive: ${zipError.message}`);
+          setLoading(false);
+          return;
+        }
+      }
+
+      // First try to decompress assuming it's gzipped
+      try {
+        const decompressed = pako.inflate(new Uint8Array(arrayBuffer));
+        const decoder = new TextDecoder('utf-8');
+        const csvString = decoder.decode(decompressed);
+
+        // Check if we should limit parsing due to large decompressed size
+        const shouldLimit = csvString.length > CSV_TEXT_LIMIT; // 5MB of text
+
+        // Process the decompressed CSV
+        processCsvString(csvString, false, shouldLimit);
+
+      } catch (decompressionError) {
+        console.log("Decompression failed, trying to read as plain text CSV", decompressionError);
+
+        // If decompression fails, try to read as plain text CSV
+        try {
+          const decoder = new TextDecoder('utf-8');
+          const csvString = decoder.decode(arrayBuffer);
+
+          // Check if it looks like a CSV (has commas or typical CSV structure)
+          if (csvString.includes(',') || csvString.includes('\n')) {
+            // For uncompressed files, check if we should limit based on size
+            const shouldLimit = fileSizeBytes > CSV_TEXT_LIMIT; // 5MB file size
+            processCsvString(csvString, false, shouldLimit);
+          } else {
+            throw new Error("File doesn't appear to be a valid CSV or compressed CSV");
+          }
+
+        } catch (textReadError) {
+          console.error("Failed to read as plain text CSV", textReadError);
+          // If both decompression and plain text reading fail, try partial fetch
+          await fetchPartialCSV(url);
+        }
+      }
+
+    } catch (err) {
+      setError(`Error: ${err.message}`);
+      setLoading(false);
+    }
+  }, [fetchPartialCSV, processCsvString]);
+
+  const currentFileUrl = useMemo(() => getCurrentUrl(), [getCurrentUrl]);
 
   // This effect will trigger whenever terminologyVersion or currentFileName changes
   useEffect(() => {
-    const url = getCurrentUrl();
-    if (!url) {
+    if (!currentFileUrl) {
       return;
     }
-    fetchAndProcessCSV(url);
+    fetchAndProcessCSV(currentFileUrl, currentFileName || '');
     // Reset pagination when URL changes
     setCurrentPage(1);
-  }, [currentFileName, currentFileFolder, terminologyVersion]);
+  }, [currentFileUrl, currentFileName, fetchAndProcessCSV]);
 
   useEffect(() => {
-    setCurrentPage(1);
-  }, [filterTerm]);
+    const isVersionedFolder = currentFileFolder
+      ? versionedFolders.has(currentFileFolder)
+      : false;
 
-  useEffect(() => {
-    if (!searchIndex || !searchIndex.maxColumns) {
-      return;
-    }
-
-    setHeaders((current) => {
-      const existing = Array.isArray(current) ? current : [];
-      if (existing.length >= searchIndex.maxColumns) {
-        return existing;
-      }
-
-      const next = existing.slice();
-      while (next.length < searchIndex.maxColumns) {
-        next.push(`Column ${next.length + 1}`);
-      }
-      return next;
-    });
-  }, [searchIndex]);
-
-  const tableComputation = useMemo(() => {
-    const normalizedQuery = filterTerm.trim().toLowerCase();
-
-    if (searchIndex && normalizedQuery) {
-      const indexResult = buildIndexSearchResults(normalizedQuery, searchIndex, MAX_INDEX_SEARCH_RESULTS);
-      if (indexResult.rows.length) {
-        return {
-          source: 'index',
-          rows: indexResult.rows.map((entry) => entry.values),
-          totalMatches: indexResult.rows.length,
-          matchCount: indexResult.matchCount,
-          truncated: indexResult.truncated,
-          rowMetadata: indexResult.rows,
-        };
-      }
-    }
-
-    const fallbackRows = normalizedQuery
-      ? csvData.filter((row) => row.some((cell) => cell && String(cell).toLowerCase().includes(normalizedQuery)))
-      : csvData;
-
-    return {
-      source: normalizedQuery ? 'preview-filter' : 'preview',
-      rows: fallbackRows,
-      totalMatches: fallbackRows.length,
-      matchCount: fallbackRows.length,
-      truncated: false,
-      rowMetadata: null,
-    };
-  }, [filterTerm, searchIndex, csvData]);
-
-  useEffect(() => {
-    const totalPages = Math.max(1, Math.ceil((tableComputation.rows.length || 1) / pageSize));
-    setCurrentPage((prev) => Math.min(prev, totalPages));
-  }, [tableComputation.rows.length, pageSize]);
-
-  const startIndex = (currentPage - 1) * pageSize;
-  const endIndex = startIndex + pageSize;
-  const paginatedRows = tableComputation.rows.slice(startIndex, endIndex);
-  const totalPages = Math.max(1, Math.ceil((tableComputation.rows.length || 1) / pageSize));
-  const summaryText = (() => {
-    if (tableComputation.source === 'index') {
-      const displayed = tableComputation.totalMatches.toLocaleString();
-      const totalMatchesText = typeof tableComputation.matchCount === 'number'
-        ? tableComputation.matchCount.toLocaleString()
-        : null;
-      const limitedText = tableComputation.truncated
-        ? ` (showing first ${MAX_INDEX_SEARCH_RESULTS.toLocaleString()} matches)`
-        : '';
-      return `Index search: showing ${displayed}${totalMatchesText ? ` of ${totalMatchesText}` : ''} matches${limitedText}`;
-    }
-
-    if (tableComputation.source === 'preview-filter') {
-      return `Filtered preview rows: ${tableComputation.totalMatches.toLocaleString()} of ${csvData.length.toLocaleString()} preview rows`;
-    }
-
-    if (isPartialData) {
-      return `Partial load preview: ${csvData.length.toLocaleString()} rows`;
-    }
-
-    return `Preview rows loaded: ${csvData.length.toLocaleString()}`;
-  })();
-  const showIndexReady = Boolean(searchIndex && !isLoadingIndex && !indexError);
-
-  useEffect(() => {
-    if (!baseCsvName || !terminologyVersion) {
+    if (!baseCsvName || !currentFileFolder || (isVersionedFolder && !terminologyVersion)) {
       setSearchIndex(null);
       setIndexError(null);
       setIsLoadingIndex(false);
       return;
     }
 
-    const targetFolder = currentFileFolder || default_folder;
-    const cacheKey = `${targetFolder}::${terminologyVersion}::${baseCsvName.toLowerCase()}`;
+    const versionKey = isVersionedFolder ? (terminologyVersion || '') : '';
+    const cacheKey = `${currentFileFolder}::${versionKey.toLowerCase()}::${baseCsvName.toLowerCase()}`;
+
     if (indexCacheRef.current.has(cacheKey)) {
       const cached = indexCacheRef.current.get(cacheKey);
       if (cached) {
@@ -1352,7 +1427,13 @@ export default function CSVViewer() {
       let lastError = null;
 
       for (const candidate of candidates) {
-        const url = buildIndexObjectUrl(targetFolder, terminologyVersion, candidate);
+        const url = buildObjectUrl(
+          currentFileFolder,
+          candidate,
+          isVersionedFolder ? terminologyVersion : undefined,
+          { useIndexFolder: true }
+        );
+
         if (!url) {
           continue;
         }
@@ -1436,7 +1517,26 @@ export default function CSVViewer() {
     return () => {
       cancelled = true;
     };
-  }, [baseCsvName, currentFileFolder, default_folder, terminologyVersion]);
+  }, [baseCsvName, buildObjectUrl, currentFileFolder, terminologyVersion, versionedFolders]);
+
+  useEffect(() => {
+    if (!searchIndex || !searchIndex.maxColumns) {
+      return;
+    }
+
+    setHeaders((current) => {
+      const existing = Array.isArray(current) ? current : [];
+      if (existing.length >= searchIndex.maxColumns) {
+        return existing;
+      }
+
+      const next = existing.slice();
+      while (next.length < searchIndex.maxColumns) {
+        next.push(`Column ${next.length + 1}`);
+      }
+      return next;
+    });
+  }, [searchIndex]);
 
   const handleGroupSelect = (groupId) => {
     const group = fileGroups.find((item) => item.id === groupId);
@@ -1476,49 +1576,103 @@ export default function CSVViewer() {
 
   useEffect(() => {
     if (!columnCount) {
-      setHeaders((prev) => (prev.length ? [] : prev));
+      if (headers.length) {
+        setHeaders([]);
+      }
       return;
     }
 
+    const fallbackHeaders = Array.from({ length: columnCount }, (_, index) => `Column ${index + 1}`);
     const entry = resolveCrosswalkEntry(currentFileFolder, terminologyVersion, currentFileName);
-    const fallbackHeaders = Array.from({ length: columnCount }, () => null);
 
     let nextHeaders = fallbackHeaders;
 
     if (entry && Array.isArray(entry.headers)) {
-      if (entry.headers.length !== columnCount) {
-        console.warn('Crosswalk headers length mismatch', {
-          folder: currentFileFolder,
-          version: terminologyVersion,
-          file: currentFileName,
-          expected: columnCount,
-          received: entry.headers.length,
-          tag: entry.tag,
-          seed: entry.seed,
-        });
-      }
-
-      nextHeaders = fallbackHeaders.map((_, index) => {
+      nextHeaders = fallbackHeaders.map((placeholder, index) => {
         const candidate = entry.headers[index];
         if (candidate === null || candidate === undefined) {
-          return null;
+          return placeholder;
         }
         const label = String(candidate).trim();
-        return label ? label : null;
+        return label || placeholder;
       });
     }
 
-    console.log('Header resolution', {
-      folder: currentFileFolder,
-      version: terminologyVersion,
-      file: currentFileName,
-      columnCount,
-      hasEntry: Boolean(entry),
-      resolvedHeaders: nextHeaders,
-    });
+    if (!arraysEqual(headers, nextHeaders)) {
+      setHeaders(nextHeaders);
+    }
+  }, [columnCount, currentFileFolder, currentFileName, headers, resolveCrosswalkEntry, terminologyVersion]);
 
-    setHeaders((prev) => (arraysEqual(prev, nextHeaders) ? prev : nextHeaders));
-  }, [columnCount, currentFileFolder, currentFileName, headerCrosswalk, terminologyVersion]);
+  const tableComputation = useMemo(() => {
+    const normalizedQuery = filterTerm.trim().toLowerCase();
+
+    if (searchIndex && normalizedQuery) {
+      const indexResult = buildIndexSearchResults(normalizedQuery, searchIndex, MAX_INDEX_SEARCH_RESULTS);
+      if (indexResult.rows.length) {
+        return {
+          source: 'index',
+          rows: indexResult.rows.map((entry) => entry.values),
+          totalMatches: indexResult.rows.length,
+          matchCount: indexResult.matchCount,
+          truncated: indexResult.truncated,
+          rowMetadata: indexResult.rows,
+        };
+      }
+    }
+
+    const fallbackRows = normalizedQuery
+      ? csvData.filter((row) => row.some((cell) => cell && String(cell).toLowerCase().includes(normalizedQuery)))
+      : csvData;
+
+    return {
+      source: normalizedQuery ? 'preview-filter' : 'preview',
+      rows: fallbackRows,
+      totalMatches: fallbackRows.length,
+      matchCount: fallbackRows.length,
+      truncated: false,
+      rowMetadata: null,
+    };
+  }, [filterTerm, searchIndex, csvData]);
+
+  useEffect(() => {
+    const totalPagesComputed = Math.max(1, Math.ceil((tableComputation.rows.length || 1) / pageSize));
+    setCurrentPage((prev) => Math.min(prev, totalPagesComputed));
+  }, [tableComputation.rows.length, pageSize]);
+
+  const startIndex = (currentPage - 1) * pageSize;
+  const endIndex = startIndex + pageSize;
+  const paginatedRows = tableComputation.rows.slice(startIndex, endIndex);
+  const totalPages = Math.max(1, Math.ceil((tableComputation.rows.length || 1) / pageSize));
+  const summaryText = (() => {
+    if (tableComputation.source === 'index') {
+      const displayed = tableComputation.totalMatches.toLocaleString();
+      const totalMatchesText = typeof tableComputation.matchCount === 'number'
+        ? tableComputation.matchCount.toLocaleString()
+        : null;
+      const limitedText = tableComputation.truncated
+        ? ` (showing first ${MAX_INDEX_SEARCH_RESULTS.toLocaleString()} matches)`
+        : '';
+      return `Index search: showing ${displayed}${totalMatchesText ? ` of ${totalMatchesText}` : ''} matches${limitedText}`;
+    }
+
+    if (tableComputation.source === 'preview-filter') {
+      return `Filtered preview rows: ${tableComputation.totalMatches.toLocaleString()} of ${csvData.length.toLocaleString()} preview rows`;
+    }
+
+    if (isPartialData) {
+      return `Partial load preview: ${csvData.length.toLocaleString()} rows`;
+    }
+
+    return `Preview rows loaded: ${csvData.length.toLocaleString()}`;
+  })();
+  const showIndexReady = Boolean(searchIndex && !isLoadingIndex && !indexError);
+
+  const handleCategoryChange = (categoryId) => {
+    if (!categoryId || categoryId === activeCategoryId) {
+      return;
+    }
+    setActiveCategoryId(categoryId);
+  };
 
   const normalizedSearch = searchTerm.trim().toLowerCase();
   const filteredGroups = fileGroups.filter((group) => {
@@ -1536,7 +1690,10 @@ export default function CSVViewer() {
     ? terminologyVersions
     : (terminologyVersion ? [terminologyVersion] : []);
 
-  const currentFileUrl = getCurrentUrl();
+  const versionLabelText = activeCategory.versionLabel || 'Version';
+  const filePanelHeading = hasVersionedSources && terminologyVersion
+    ? `Available Files - Version ${terminologyVersion}`
+    : 'Available Files';
 
   return (
     <div style={{
@@ -1555,68 +1712,114 @@ export default function CSVViewer() {
         alignItems: 'center',
         justifyContent: 'space-between',
         width: 'calc(100% - 32px)',
-        zIndex: 10
+        zIndex: 10,
+        gap: '16px'
       }}>
-        <h1 style={{
-          fontSize: '1.5rem',
-          fontWeight: 'bold',
-          margin: 0
-        }}>Tuva Terminology Viewer</h1>
-
         <div style={{
           display: 'flex',
           flexDirection: 'column',
-          alignItems: 'flex-end',
+          alignItems: 'flex-start',
+          gap: '8px',
           maxWidth: '100%'
         }}>
-          <label htmlFor="terminology-version" style={{
-            fontSize: '12px',
-            fontWeight: 600,
-            color: '#4b5563',
-            marginBottom: '4px'
-          }}>
-            Terminology version
-          </label>
-          <select
-            id="terminology-version"
-            value={terminologyVersion ?? ''}
-            onChange={(event) => handleVersionChange(event.target.value)}
-            disabled={isLoadingVersions || !availableVersions.length}
+          <h1 style={{
+            fontSize: '1.5rem',
+            fontWeight: 'bold',
+            margin: 0
+          }}>Tuva Terminology Viewer</h1>
+          <div
+            role="tablist"
+            aria-label="Data category"
             style={{
-              minWidth: '200px',
-              padding: '8px 12px',
-              borderRadius: '8px',
-              border: '1px solid #d1d5db',
-              fontSize: '14px',
-              fontWeight: 500,
-              color: '#111827',
-              backgroundColor: isLoadingVersions ? '#f9fafb' : 'white'
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: '8px'
             }}
           >
-            {isLoadingVersions ? (
-              <option value="" disabled>Loading versions…</option>
-            ) : (
-              <>
-                {!terminologyVersion && <option value="" disabled>Choose a version</option>}
-                {availableVersions.map((version) => (
-                  <option key={version} value={version}>
-                    {version}
-                  </option>
-                ))}
-              </>
-            )}
-          </select>
-          {!isLoadingVersions && !availableVersions.length && !versionLoadError && (
-            <span style={{ marginTop: '4px', fontSize: '12px', color: '#dc2626' }}>
-              No versions available
-            </span>
-          )}
-          {versionLoadError && (
-            <span style={{ marginTop: '4px', fontSize: '12px', color: '#dc2626' }}>
-              {versionLoadError}
-            </span>
-          )}
+            {dataCategories.map((category) => {
+              const isActive = category.id === activeCategoryId;
+              return (
+                <button
+                  key={category.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  onClick={() => handleCategoryChange(category.id)}
+                  style={{
+                    padding: '6px 14px',
+                    borderRadius: '9999px',
+                    border: `1px solid ${isActive ? '#1d4ed8' : '#d1d5db'}`,
+                    backgroundColor: isActive ? '#1d4ed8' : 'white',
+                    color: isActive ? '#ffffff' : '#1f2937',
+                    fontSize: '14px',
+                    fontWeight: isActive ? 600 : 500,
+                    cursor: 'pointer',
+                    transition: 'background-color 0.2s ease, color 0.2s ease'
+                  }}
+                >
+                  {category.label}
+                </button>
+              );
+            })}
+          </div>
         </div>
+
+        {hasVersionedSources && (
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'flex-end',
+            maxWidth: '100%'
+          }}>
+            <label htmlFor="terminology-version" style={{
+              fontSize: '12px',
+              fontWeight: 600,
+              color: '#4b5563',
+              marginBottom: '4px'
+            }}>
+              {versionLabelText}
+            </label>
+            <select
+              id="terminology-version"
+              value={terminologyVersion ?? ''}
+              onChange={(event) => handleVersionChange(event.target.value)}
+              disabled={isLoadingVersions || !availableVersions.length}
+              style={{
+                minWidth: '200px',
+                padding: '8px 12px',
+                borderRadius: '8px',
+                border: '1px solid #d1d5db',
+                fontSize: '14px',
+                fontWeight: 500,
+                color: '#111827',
+                backgroundColor: isLoadingVersions ? '#f9fafb' : 'white'
+              }}
+            >
+              {isLoadingVersions ? (
+                <option value="" disabled>Loading versions…</option>
+              ) : (
+                <>
+                  {!terminologyVersion && <option value="" disabled>Choose a version</option>}
+                  {availableVersions.map((version) => (
+                    <option key={version} value={version}>
+                      {version}
+                    </option>
+                  ))}
+                </>
+              )}
+            </select>
+            {!isLoadingVersions && !availableVersions.length && !versionLoadError && (
+              <span style={{ marginTop: '4px', fontSize: '12px', color: '#dc2626' }}>
+                No versions available
+              </span>
+            )}
+            {versionLoadError && (
+              <span style={{ marginTop: '4px', fontSize: '12px', color: '#dc2626' }}>
+                {versionLoadError}
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Left sidebar with file list */}
@@ -1638,7 +1841,7 @@ export default function CSVViewer() {
           fontSize: '1.125rem',
           fontWeight: 600,
           marginBottom: '12px'
-        }}>Available Files - Version {terminologyVersion}</h2>
+        }}>{filePanelHeading}</h2>
 
         <div style={{
           position: 'relative',
@@ -1946,7 +2149,6 @@ export default function CSVViewer() {
                   width: '16px',
                   height: '16px'
                 }} />
-              </div>
               {tableComputation.source === 'index' && tableComputation.truncated && (
                 <div style={{
                   fontSize: '12px',
@@ -1965,7 +2167,7 @@ export default function CSVViewer() {
                   Search is limited to the preview because no pre-built index was found for this dataset.
                 </div>
               )}
-              
+
               <div style={{
                 overflowY: 'auto',
                 flexGrow: 1
@@ -2040,7 +2242,8 @@ export default function CSVViewer() {
                   borderTop: '1px solid #e5e7eb',
                   marginTop: '16px'
                 }}>
-                  <div style={{ display: 'flex', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', alignItems: 'center' }}
+                  >
                     <span style={{ marginRight: '8px', fontSize: '14px' }}>Rows per page:</span>
                     <select 
                       value={pageSize}
@@ -2062,7 +2265,8 @@ export default function CSVViewer() {
                     </select>
                   </div>
                   
-                  <div style={{ display: 'flex', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', alignItems: 'center' }}
+                  >
                     <button
                       onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
                       disabled={currentPage === 1}
@@ -2079,7 +2283,8 @@ export default function CSVViewer() {
                       Previous
                     </button>
 
-                    <span style={{ margin: '0 8px', fontSize: '14px' }}>
+                    <span style={{ margin: '0 8px', fontSize: '14px' }}
+                    >
                       Page {Math.min(currentPage, totalPages)} of {totalPages}
                     </span>
 

@@ -26,7 +26,7 @@ WARNING: This will deploy the build to the active public URL. Do not use this fo
 
 ## Generating search indexes
 
-Large terminology datasets can be searched without loading every CSV row in the browser by precomputing compressed index files. The static app looks for files named `<base>.index.json.gz` (or `.json`) under the parallel `terminology_indices/<version>/...` path; when no index exists (for example, smaller datasets under the preview size) the UI falls back to the partial preview rows you see today.
+Large terminology datasets can be searched without loading every CSV row in the browser by precomputing compressed index files. The static app looks for files named `<base>.index.json.gz` (or `.json`) under the parallel index prefixes for each dataset (for example `terminology_indices/<version>/...`, `provider_indices/<version>/...`, `value_set_indices/<version>/...`, or `reference_data_indices/...`). When no index exists (for example, smaller datasets under the preview size) the UI falls back to the partial preview rows you see today.
 
 Use the offline Node.js script to build these assets:
 
@@ -44,17 +44,19 @@ Datasets with total rows at or below the threshold are skipped automatically bec
 
 Each run groups multi-part files such as `admit_source.csv_0.csv.gz`, `admit_source.csv_1.csv.gz`, etc., records row metadata, and writes an inverted token index that the frontend loads on demand.
 
-After publishing the generated `.index.json.gz` files under `terminology_indices/<version>/...`, the GitHub Pages build will automatically pick them up and route search queries through the new index-backed flow.
+After publishing the generated `.index.json.gz` files under the appropriate index prefix (for example `terminology_indices/<version>/...` or `value_set_indices/<version>/...`), the GitHub Pages build will automatically pick them up and route search queries through the new index-backed flow.
 
 ### Automating the sync/build/upload loop
 
-When you are ready to refresh the live indexes for the most recent releases, the helper script at `scripts/update_terminology_indices.sh` can download the changing S3 folders (`latest` and the newest numeric version), rebuild any necessary indexes, and push the refreshed `.index.json.gz` files back to S3:
+When you are ready to refresh the live indexes for the most recent releases, the helper script at `scripts/update_terminology_indices.sh` can download the changing S3 folders (`latest` and the newest numeric version), rebuild any necessary indexes, and push the refreshed `.index.json.gz` files back to S3. It handles the terminology, provider data, value sets, and reference data folders in a single pass:
 
 ```bash
 ./scripts/update_terminology_indices.sh --active-version 0.15.2
 ```
 
-The script defaults to the `tuva-public-resources` bucket and to the `versioned_terminology`/`terminology_indices` prefixes. Pass `--versions` if you need to process additional folders, `--min-rows` to override the index-size cutoff, `--max-old-space-size` to increase Node’s heap (useful for the largest datasets), or `--dry-run` to see what would happen without making changes. You will need AWS CLI credentials configured locally before running it.
+Need to limit the run? Add `--targets terminology,value-sets` to process specific datasets, and use the per-prefix flags if your S3 layout differs from the defaults.
+
+The script defaults to the `tuva-public-resources` bucket and the standard prefixes (`versioned_terminology`, `versioned_provider_data`, `versioned_value_sets`, and `reference-data`). Pass `--versions` if you need to process particular releases, `--min-rows` to override the index-size cutoff, `--max-old-space-size` to increase Node’s heap (useful for the largest datasets), or `--dry-run` to see what would happen without making changes. You will need AWS CLI credentials configured locally before running it.
 
 ### Testing indexes locally
 
