@@ -11,6 +11,12 @@ const PARTIAL_PREVIEW_ROW_LIMIT = typeof limits?.partialPreviewRowLimit === 'num
   ? limits.partialPreviewRowLimit
   : 50000;
 
+const BINARY_INDEX_MAGIC = 'TVIDXB';
+const BINARY_INDEX_HEADER_SIZE = 112;
+const TYPE_UINT16 = 1;
+const TYPE_UINT32 = 2;
+const binaryTextDecoder = new TextDecoder('utf-8');
+
 const tokenizeQuery = (value = '') => Array.from(new Set(
   value
     .trim()
@@ -53,23 +59,356 @@ const normalizeIndexPayload = (raw = {}) => {
   const tokens = Array.isArray(raw.tokens) ? raw.tokens : [];
   const defaultLookup = Object.fromEntries(tokens.map((token, index) => [token, index]));
 
+  const inferUintArray = (value, Type) => {
+    if (!value || (Array.isArray(value) && value.length === 0)) {
+      return new Type(0);
+    }
+    if (value instanceof Type) {
+      return value;
+    }
+    if (ArrayBuffer.isView(value)) {
+      return new Type(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+    }
+    if (Array.isArray(value)) {
+      return Type.from(value);
+    }
+    return new Type(0);
+  };
+
+  let rowOffsets = null;
+  if (raw.rowOffsets) {
+    rowOffsets = inferUintArray(raw.rowOffsets, Uint32Array);
+  }
+
+  let rowData = null;
+  if (raw.rowData) {
+    rowData = inferUintArray(raw.rowData, Uint32Array);
+  }
+
+  let rowFiles = null;
+  const rowFilesTypeValue = raw.rowFilesType === TYPE_UINT32 ? TYPE_UINT32 : TYPE_UINT16;
+  if (raw.rowFiles) {
+    const Type = rowFilesTypeValue === TYPE_UINT32 ? Uint32Array : Uint16Array;
+    rowFiles = inferUintArray(raw.rowFiles, Type);
+  }
+
+  let rowPositions = null;
+  if (raw.rowPositions) {
+    rowPositions = inferUintArray(raw.rowPositions, Uint32Array);
+  }
+
+  let postingOffsets = null;
+  if (raw.postingOffsets) {
+    postingOffsets = inferUintArray(raw.postingOffsets, Uint32Array);
+  }
+
+  let postingsData = null;
+  if (raw.postingsData) {
+    postingsData = inferUintArray(raw.postingsData, Uint32Array);
+  }
+
+  const hasTypedLayout = Boolean(rowOffsets && rowData && rowFiles && rowPositions && postingOffsets && postingsData);
+
+  let rows = Array.isArray(raw.rows) ? raw.rows : [];
+  if (!hasTypedLayout && rows.length) {
+    const offsets = new Uint32Array(rows.length + 1);
+    let totalCells = 0;
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = Array.isArray(rows[index]) ? rows[index] : [];
+      offsets[index] = totalCells;
+      totalCells += row.length;
+    }
+    offsets[offsets.length - 1] = totalCells;
+    rowOffsets = offsets;
+    rowData = new Uint32Array(totalCells);
+    let cursor = 0;
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = Array.isArray(rows[index]) ? rows[index] : [];
+      for (let cellIndex = 0; cellIndex < row.length; cellIndex += 1) {
+        rowData[cursor] = row[cellIndex] >>> 0;
+        cursor += 1;
+      }
+    }
+    rowFiles = inferUintArray(raw.rowFiles, Uint16Array);
+    rowPositions = inferUintArray(raw.rowPositions, Uint32Array);
+  }
+
+  let postings = [];
+  if (Array.isArray(raw.postings)) {
+    postings = raw.postings.map((posting) => new Uint32Array(posting));
+  }
+
+  const dataset = raw.dataset || null;
+  const generatedAt = raw.generatedAt || null;
+  const totalRows = typeof raw.totalRows === 'number' ? raw.totalRows : 0;
+  const maxColumns = typeof raw.maxColumns === 'number' ? raw.maxColumns : 0;
+  const valueColumnLimit = typeof raw.valueColumnLimit === 'number' ? raw.valueColumnLimit : 0;
+  const files = Array.isArray(raw.files) ? raw.files : [];
+  const dictionary = Array.isArray(raw.dictionary) ? raw.dictionary : [];
+  const tokenLookup = raw.tokenLookup && typeof raw.tokenLookup === 'object'
+    ? raw.tokenLookup
+    : defaultLookup;
+
   return {
-    dataset: raw.dataset || null,
-    generatedAt: raw.generatedAt || null,
-    totalRows: typeof raw.totalRows === 'number' ? raw.totalRows : 0,
-    maxColumns: typeof raw.maxColumns === 'number' ? raw.maxColumns : 0,
-    files: Array.isArray(raw.files) ? raw.files : [],
-    dictionary: Array.isArray(raw.dictionary) ? raw.dictionary : [],
-    rows: Array.isArray(raw.rows) ? raw.rows : [],
-    rowFiles: raw.rowFiles ? new Uint16Array(raw.rowFiles) : new Uint16Array(),
-    rowPositions: raw.rowPositions ? new Uint32Array(raw.rowPositions) : new Uint32Array(),
+    dataset,
+    generatedAt,
+    totalRows,
+    maxColumns,
+    valueColumnLimit,
+    files,
+    dictionary,
+    rows,
+    rowOffsets: rowOffsets || new Uint32Array(0),
+    rowData: rowData || new Uint32Array(0),
+    rowFiles: rowFiles || new Uint16Array(0),
+    rowFilesType: rowFilesTypeValue,
+    rowPositions: rowPositions || new Uint32Array(0),
     tokens,
-    tokenLookup: raw.tokenLookup && typeof raw.tokenLookup === 'object'
-      ? raw.tokenLookup
-      : defaultLookup,
-    postings: Array.isArray(raw.postings)
-      ? raw.postings.map((posting) => new Uint32Array(posting))
-      : [],
+    tokenLookup,
+    postings,
+    postingOffsets: postingOffsets || new Uint32Array(0),
+    postingsData: postingsData || new Uint32Array(0),
+    format: hasTypedLayout ? 'json-typed' : 'json',
+  };
+};
+
+const toArrayBuffer = (input) => {
+  if (input instanceof ArrayBuffer) {
+    return input;
+  }
+  if (ArrayBuffer.isView(input)) {
+    return input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength);
+  }
+  throw new Error('Unsupported buffer type.');
+};
+
+const readLengthPrefixedStrings = (arrayBuffer, offset, count, totalBytes) => {
+  const values = new Array(count);
+  let cursor = offset;
+  for (let index = 0; index < count; index += 1) {
+    if (cursor + 4 > offset + totalBytes) {
+      throw new Error('Corrupted string section.');
+    }
+    const length = new DataView(arrayBuffer, cursor, 4).getUint32(0, true);
+    cursor += 4;
+    if (cursor + length > offset + totalBytes) {
+      throw new Error('Corrupted string payload.');
+    }
+    const bytes = new Uint8Array(arrayBuffer, cursor, length);
+    values[index] = binaryTextDecoder.decode(bytes);
+    cursor += length;
+  }
+  return { values, nextOffset: offset + totalBytes };
+};
+
+const readFilesMetadata = (arrayBuffer, offset, count, totalBytes) => {
+  const files = new Array(count);
+  let cursor = offset;
+  for (let index = 0; index < count; index += 1) {
+    if (cursor + 4 > offset + totalBytes) {
+      throw new Error('Corrupted files metadata section.');
+    }
+    const nameLength = new DataView(arrayBuffer, cursor, 4).getUint32(0, true);
+    cursor += 4;
+    if (cursor + nameLength + 4 > offset + totalBytes) {
+      throw new Error('Corrupted file metadata payload.');
+    }
+    const nameBytes = new Uint8Array(arrayBuffer, cursor, nameLength);
+    cursor += nameLength;
+    const rowCount = new DataView(arrayBuffer, cursor, 4).getUint32(0, true);
+    cursor += 4;
+    files[index] = {
+      name: binaryTextDecoder.decode(nameBytes),
+      rowCount,
+    };
+  }
+  return { files, nextOffset: offset + totalBytes };
+};
+
+const decodeBinaryIndex = (rawBuffer) => {
+  const arrayBuffer = toArrayBuffer(rawBuffer);
+  if (!arrayBuffer || arrayBuffer.byteLength < BINARY_INDEX_HEADER_SIZE) {
+    throw new Error('Binary index payload is too small.');
+  }
+
+  const headerView = new DataView(arrayBuffer, 0, BINARY_INDEX_HEADER_SIZE);
+  const magic = String.fromCharCode(
+    headerView.getUint8(0),
+    headerView.getUint8(1),
+    headerView.getUint8(2),
+    headerView.getUint8(3),
+    headerView.getUint8(4),
+    headerView.getUint8(5),
+  );
+  if (magic !== BINARY_INDEX_MAGIC) {
+    throw new Error('Unrecognised binary index payload.');
+  }
+
+  const version = headerView.getUint8(6);
+  if (version !== 1) {
+    throw new Error(`Unsupported binary index version: ${version}`);
+  }
+
+  let headerOffset = 8;
+  const readUint32 = () => {
+    const value = headerView.getUint32(headerOffset, true);
+    headerOffset += 4;
+    return value;
+  };
+
+  const datasetLength = readUint32();
+  const generatedAtLength = readUint32();
+  const dictionaryCount = readUint32();
+  const dictionaryBytes = readUint32();
+  const tokensCount = readUint32();
+  const tokensBytes = readUint32();
+  const filesCount = readUint32();
+  const filesBytes = readUint32();
+  const totalRows = readUint32();
+  const maxColumns = readUint32();
+  const valueColumnLimit = readUint32();
+  const totalCells = readUint32();
+  const postingsCount = readUint32();
+  const postingOffsetsCount = readUint32();
+  const rowOffsetsCount = readUint32();
+  const rowFilesCount = readUint32();
+  const rowPositionsCount = readUint32();
+  const rowFilesType = headerView.getUint8(headerOffset);
+  headerOffset += 1;
+  const rowPositionsType = headerView.getUint8(headerOffset);
+  headerOffset += 1;
+  const rowDataType = headerView.getUint8(headerOffset);
+  headerOffset += 1;
+  const postingsType = headerView.getUint8(headerOffset);
+  headerOffset += 1;
+  const rowOffsetsBytes = readUint32();
+  const rowDataBytes = readUint32();
+  const rowFilesBytes = readUint32();
+  const rowPositionsBytes = readUint32();
+  const postingOffsetsBytes = readUint32();
+  const postingsBytes = readUint32();
+
+  let cursor = BINARY_INDEX_HEADER_SIZE;
+
+  const datasetBytes = new Uint8Array(arrayBuffer, cursor, datasetLength);
+  const dataset = binaryTextDecoder.decode(datasetBytes);
+  cursor += datasetLength;
+
+  const generatedAtBytes = new Uint8Array(arrayBuffer, cursor, generatedAtLength);
+  const generatedAt = binaryTextDecoder.decode(generatedAtBytes);
+  cursor += generatedAtLength;
+
+  const { values: dictionary, nextOffset: afterDictionary } = readLengthPrefixedStrings(
+    arrayBuffer,
+    cursor,
+    dictionaryCount,
+    dictionaryBytes,
+  );
+  cursor = afterDictionary;
+
+  const { values: tokens, nextOffset: afterTokens } = readLengthPrefixedStrings(
+    arrayBuffer,
+    cursor,
+    tokensCount,
+    tokensBytes,
+  );
+  cursor = afterTokens;
+
+  const { files, nextOffset: afterFiles } = readFilesMetadata(
+    arrayBuffer,
+    cursor,
+    filesCount,
+    filesBytes,
+  );
+  cursor = afterFiles;
+
+  const rowOffsets = rowOffsetsBytes
+    ? new Uint32Array(arrayBuffer.slice(cursor, cursor + rowOffsetsBytes))
+    : new Uint32Array(0);
+  cursor += rowOffsetsBytes;
+
+  let rowData;
+  if (rowDataType !== TYPE_UINT32) {
+    throw new Error('Unsupported row data encoding.');
+  }
+  rowData = rowDataBytes
+    ? new Uint32Array(arrayBuffer.slice(cursor, cursor + rowDataBytes))
+    : new Uint32Array(0);
+  cursor += rowDataBytes;
+
+  let rowFiles;
+  if (rowFilesType === TYPE_UINT16) {
+    rowFiles = rowFilesBytes
+      ? new Uint16Array(arrayBuffer.slice(cursor, cursor + rowFilesBytes))
+      : new Uint16Array(0);
+  } else if (rowFilesType === TYPE_UINT32) {
+    rowFiles = rowFilesBytes
+      ? new Uint32Array(arrayBuffer.slice(cursor, cursor + rowFilesBytes))
+      : new Uint32Array(0);
+  } else {
+    throw new Error('Unsupported row file encoding.');
+  }
+  cursor += rowFilesBytes;
+
+  if (rowPositionsType !== TYPE_UINT32) {
+    throw new Error('Unsupported row position encoding.');
+  }
+  const rowPositions = rowPositionsBytes
+    ? new Uint32Array(arrayBuffer.slice(cursor, cursor + rowPositionsBytes))
+    : new Uint32Array(0);
+  cursor += rowPositionsBytes;
+
+  if (postingsType !== TYPE_UINT32) {
+    throw new Error('Unsupported postings encoding.');
+  }
+  const postingOffsets = postingOffsetsBytes
+    ? new Uint32Array(arrayBuffer.slice(cursor, cursor + postingOffsetsBytes))
+    : new Uint32Array(0);
+  cursor += postingOffsetsBytes;
+
+  const postingsData = postingsBytes
+    ? new Uint32Array(arrayBuffer.slice(cursor, cursor + postingsBytes))
+    : new Uint32Array(0);
+  cursor += postingsBytes;
+
+  if (postingOffsets.length !== postingOffsetsCount) {
+    throw new Error('Posting offsets metadata mismatch.');
+  }
+  if (rowOffsets.length !== rowOffsetsCount) {
+    throw new Error('Row offsets metadata mismatch.');
+  }
+  if (rowFiles.length !== rowFilesCount) {
+    throw new Error('Row files metadata mismatch.');
+  }
+  if (rowPositions.length !== rowPositionsCount) {
+    throw new Error('Row positions metadata mismatch.');
+  }
+  if (postingsData.length !== postingsCount) {
+    throw new Error('Postings metadata mismatch.');
+  }
+
+  const tokenLookup = Object.fromEntries(tokens.map((token, index) => [token, index]));
+
+  return {
+    version,
+    dataset,
+    generatedAt,
+    totalRows,
+    maxColumns,
+    valueColumnLimit,
+    totalCells,
+    files,
+    dictionary,
+    tokens,
+    tokenLookup,
+    postingOffsets,
+    postingsData,
+    rowOffsets,
+    rowData,
+    rowFiles,
+    rowFilesType,
+    rowPositions,
+    format: 'binary',
   };
 };
 
@@ -93,12 +432,82 @@ const buildIndexSearchResults = (query, searchIndex, limit = MAX_INDEX_SEARCH_RE
     };
   }
 
+  const getPostingForToken = (tokenIndex) => {
+    if (tokenIndex === null || tokenIndex === undefined || Number.isNaN(tokenIndex)) {
+      return null;
+    }
+    if (Array.isArray(searchIndex.postings)) {
+      return searchIndex.postings[tokenIndex] || null;
+    }
+    if (searchIndex.postingOffsets && ArrayBuffer.isView(searchIndex.postingsData)) {
+      const offsets = searchIndex.postingOffsets;
+      if (tokenIndex < 0 || tokenIndex >= offsets.length - 1) {
+        return null;
+      }
+      const start = offsets[tokenIndex];
+      const end = offsets[tokenIndex + 1];
+      return searchIndex.postingsData.subarray(start, end);
+    }
+    return null;
+  };
+
+  const getRowValues = (rowIndex) => {
+    if (Array.isArray(searchIndex.rows)) {
+      const encodedRow = searchIndex.rows[rowIndex];
+      if (!Array.isArray(encodedRow)) {
+        return [];
+      }
+      return encodedRow.map((valueIndex) => searchIndex.dictionary[valueIndex] ?? '');
+    }
+
+    if (searchIndex.rowOffsets && ArrayBuffer.isView(searchIndex.rowData)) {
+      const offsets = searchIndex.rowOffsets;
+      if (rowIndex < 0 || rowIndex >= offsets.length - 1) {
+        return [];
+      }
+      const start = offsets[rowIndex];
+      const end = offsets[rowIndex + 1];
+      const values = new Array(end - start);
+      let pointer = 0;
+      for (let i = start; i < end; i += 1) {
+        const dictionaryIndex = searchIndex.rowData[i];
+        values[pointer] = searchIndex.dictionary[dictionaryIndex] ?? '';
+        pointer += 1;
+      }
+      return values;
+    }
+
+    return [];
+  };
+
+  const getRowFileIndex = (rowIndex) => {
+    const rowFiles = searchIndex.rowFiles;
+    if (!rowFiles) {
+      return 0;
+    }
+    if (Array.isArray(rowFiles) || ArrayBuffer.isView(rowFiles)) {
+      return rowFiles[rowIndex] ?? 0;
+    }
+    return 0;
+  };
+
+  const getRowPosition = (rowIndex) => {
+    const rowPositions = searchIndex.rowPositions;
+    if (!rowPositions) {
+      return 0;
+    }
+    if (Array.isArray(rowPositions) || ArrayBuffer.isView(rowPositions)) {
+      return rowPositions[rowIndex] ?? 0;
+    }
+    return 0;
+  };
+
   let candidateRows = null;
 
   for (const term of terms) {
     const tokenIndex = searchIndex.tokenLookup?.[term];
-    const directPostings = (typeof tokenIndex === 'number' && searchIndex.postings[tokenIndex])
-      ? searchIndex.postings[tokenIndex]
+    const directPostings = typeof tokenIndex === 'number'
+      ? getPostingForToken(tokenIndex)
       : null;
 
     const shouldExpandPartials = !directPostings
@@ -125,7 +534,7 @@ const buildIndexSearchResults = (query, searchIndex, limit = MAX_INDEX_SEARCH_RE
           continue;
         }
 
-        const posting = searchIndex.postings[i];
+        const posting = getPostingForToken(i);
         for (let j = 0; j < posting.length; j += 1) {
           rowSet.add(posting[j]);
         }
@@ -173,13 +582,10 @@ const buildIndexSearchResults = (query, searchIndex, limit = MAX_INDEX_SEARCH_RE
 
   for (let i = 0; i < candidateRows.length; i += 1) {
     const rowIndex = candidateRows[i];
-    const encodedRow = searchIndex.rows[rowIndex];
-
-    if (!Array.isArray(encodedRow)) {
+    const rowValues = getRowValues(rowIndex);
+    if (!rowValues.length) {
       continue;
     }
-
-    const rowValues = encodedRow.map((valueIndex) => dictionary[valueIndex] ?? '');
     const rowText = rowValues.join(' ').toLowerCase();
 
     if (!rowText.includes(lowerQuery)) {
@@ -189,8 +595,8 @@ const buildIndexSearchResults = (query, searchIndex, limit = MAX_INDEX_SEARCH_RE
     matches.push({
       rowIndex,
       values: rowValues,
-      fileIndex: searchIndex.rowFiles[rowIndex] ?? 0,
-      rowPosition: searchIndex.rowPositions[rowIndex] ?? 0,
+      fileIndex: getRowFileIndex(rowIndex),
+      rowPosition: getRowPosition(rowIndex),
     });
 
     if (matches.length >= limit) {
@@ -480,6 +886,10 @@ export default function CSVViewer() {
   };
 
   const toBaseCsvName = useCallback((fileName = '') => {
+    if (typeof fileName !== 'string') {
+      return '';
+    }
+
     const normalized = fileName.trim();
     if (!normalized) {
       return '';
@@ -1420,6 +1830,8 @@ export default function CSVViewer() {
 
     const fetchIndex = async () => {
       const candidates = [
+        `${baseCsvName}.index.bin.gz`,
+        `${baseCsvName}.index.bin`,
         `${baseCsvName}.index.json.gz`,
         `${baseCsvName}.index.json`
       ];
@@ -1451,6 +1863,19 @@ export default function CSVViewer() {
           }
 
           const arrayBuffer = await response.arrayBuffer();
+
+          if (candidate.endsWith('.bin') || candidate.endsWith('.bin.gz')) {
+            try {
+              const binaryBuffer = candidate.endsWith('.gz')
+                ? toArrayBuffer(pako.ungzip(new Uint8Array(arrayBuffer)))
+                : arrayBuffer;
+              return decodeBinaryIndex(binaryBuffer);
+            } catch (binaryError) {
+              lastError = new Error(`Unable to load binary index ${candidate}: ${binaryError.message}`);
+              continue;
+            }
+          }
+
           let jsonText;
 
           if (candidate.endsWith('.gz')) {
@@ -1467,8 +1892,12 @@ export default function CSVViewer() {
             jsonText = new TextDecoder('utf-8').decode(arrayBuffer);
           }
 
-          const parsed = JSON.parse(jsonText);
-          return normalizeIndexPayload(parsed);
+          try {
+            const parsed = JSON.parse(jsonText);
+            return normalizeIndexPayload(parsed);
+          } catch (jsonError) {
+            lastError = new Error(`Unable to parse ${candidate}: ${jsonError.message}`);
+          }
         } catch (err) {
           lastError = err;
         }
@@ -1666,6 +2095,7 @@ export default function CSVViewer() {
     return `Preview rows loaded: ${csvData.length.toLocaleString()}`;
   })();
   const showIndexReady = Boolean(searchIndex && !isLoadingIndex && !indexError);
+  const storedColumnLimit = searchIndex?.valueColumnLimit || 0;
 
   const handleCategoryChange = (categoryId) => {
     if (!categoryId || categoryId === activeCategoryId) {
@@ -2052,6 +2482,15 @@ export default function CSVViewer() {
                     Index ready · {searchIndex.totalRows.toLocaleString()} rows searchable
                   </p>
                 )}
+                {showIndexReady && storedColumnLimit > 0 && columnCount > storedColumnLimit && (
+                  <p style={{
+                    fontSize: '12px',
+                    color: '#6b7280',
+                    margin: '4px 0 0 0'
+                  }}>
+                    Index includes the first {storedColumnLimit.toLocaleString()} column{storedColumnLimit === 1 ? '' : 's'} per row. Download to view all columns.
+                  </p>
+                )}
                 {currentFileUrl && (
                   <p style={{
                     fontSize: '12px',
@@ -2149,6 +2588,7 @@ export default function CSVViewer() {
                   width: '16px',
                   height: '16px'
                 }} />
+              </div>
               {tableComputation.source === 'index' && tableComputation.truncated && (
                 <div style={{
                   fontSize: '12px',
