@@ -1,205 +1,155 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import JSZip from 'jszip';
 import CSVViewer from './CSVViewer';
+import SearchWorkerClient from './lib/SearchWorkerClient';
 
-describe('CSVViewer version loading', () => {
-  const terminologyListing = `<?xml version="1.0" encoding="UTF-8"?>
-  <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>tuva-public-resources</Name>
-    <Prefix>versioned_terminology/</Prefix>
-    <Delimiter>/</Delimiter>
-    <IsTruncated>false</IsTruncated>
-    <CommonPrefixes><Prefix>versioned_terminology/0.14.1/</Prefix></CommonPrefixes>
-    <CommonPrefixes><Prefix>versioned_terminology/0.14.2/</Prefix></CommonPrefixes>
-    <CommonPrefixes><Prefix>versioned_terminology/latest/</Prefix></CommonPrefixes>
-  </ListBucketResult>`;
+jest.mock('./lib/SearchWorkerClient');
 
-  const providerListing = `<?xml version="1.0" encoding="UTF-8"?>
-  <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>tuva-public-resources</Name>
-    <Prefix>versioned_provider_data/</Prefix>
-    <Delimiter>/</Delimiter>
-    <IsTruncated>false</IsTruncated>
-    <CommonPrefixes><Prefix>versioned_provider_data/0.14.2/</Prefix></CommonPrefixes>
-    <CommonPrefixes><Prefix>versioned_provider_data/latest/</Prefix></CommonPrefixes>
-  </ListBucketResult>`;
+describe('CSVViewer', () => {
+  const datasetIndexUrl = `${(process.env.PUBLIC_URL || '').replace(/\/$/, '')}/data/sqlite/datasets.json`;
+  const datasetIndexAbsoluteUrl = new URL(datasetIndexUrl, 'http://localhost').toString();
 
-  const terminologyFilesListing = `<?xml version="1.0" encoding="UTF-8"?>
-  <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>tuva-public-resources</Name>
-    <Prefix>versioned_terminology/0.14.2/</Prefix>
-    <IsTruncated>false</IsTruncated>
-    <Contents><Key>versioned_terminology/0.14.2/admit_source.csv_0_0_0.csv.gz</Key></Contents>
-    <Contents><Key>versioned_terminology/0.14.2/admit_source.csv_0_0_1.csv.gz</Key></Contents>
-  </ListBucketResult>`;
+  const datasetIndex = [
+    {
+      datasetId: 'sample',
+      label: 'Sample Dataset',
+      manifest: './sample/manifest.json',
+      generatedAt: '2025-01-01T00:00:00.000Z',
+      rowCount: 4,
+      shardCount: 1,
+    },
+  ];
 
-  const providerFilesListing = `<?xml version="1.0" encoding="UTF-8"?>
-  <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>tuva-public-resources</Name>
-    <Prefix>versioned_provider_data/0.14.2/</Prefix>
-    <IsTruncated>false</IsTruncated>
-    <Contents><Key>versioned_provider_data/0.14.2/provider.csv_0_0_0.csv.gz</Key></Contents>
-  </ListBucketResult>`;
+  const manifest = {
+    datasetId: 'sample',
+    label: 'Sample Dataset',
+    rowCount: 4,
+    shardCount: 1,
+    pageSizeBytes: 4096,
+    narrowColumns: ['code', 'name', 'city'],
+    resources: [
+      {
+        shard: 0,
+        file: 'sample.sqlite',
+        url: './sample.sqlite',
+        routing: null,
+        size: 1024,
+        sha256: 'abc',
+      },
+    ],
+    preview: {
+      url: './preview.json',
+      rows: 4,
+    },
+  };
 
-  const valueSetsListing = `<?xml version="1.0" encoding="UTF-8"?>
-  <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>tuva-public-resources</Name>
-    <Prefix>versioned_value_sets/</Prefix>
-    <Delimiter>/</Delimiter>
-    <IsTruncated>false</IsTruncated>
-    <CommonPrefixes><Prefix>versioned_value_sets/2023.01/</Prefix></CommonPrefixes>
-  </ListBucketResult>`;
+  const preview = {
+    datasetId: 'sample',
+    generatedAt: '2025-01-01T00:00:00.000Z',
+    columns: ['code', 'name', 'city'],
+    rows: [
+      ['1001', 'Alpha Clinic', 'Seattle'],
+      ['1002', 'Beta Health', 'Portland'],
+    ],
+  };
 
-  const valueSetsFilesListing = `<?xml version="1.0" encoding="UTF-8"?>
-  <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>tuva-public-resources</Name>
-    <Prefix>versioned_value_sets/2023.01/</Prefix>
-    <IsTruncated>false</IsTruncated>
-    <Contents><Key>versioned_value_sets/2023.01/value_set.csv.gz</Key></Contents>
-  </ListBucketResult>`;
-
-  const referenceListing = `<?xml version="1.0" encoding="UTF-8"?>
-  <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>tuva-public-resources</Name>
-    <Prefix>reference-data/</Prefix>
-    <IsTruncated>false</IsTruncated>
-    <Contents><Key>reference-data/reference.zip</Key></Contents>
-    <Contents><Key>reference-data/2022 Census Shapefiles/shapes.zip</Key></Contents>
-  </ListBucketResult>`;
-
-  let referenceZipBuffer;
-
-  beforeEach(async () => {
-    const csvBuffer = Uint8Array.from(Buffer.from('col1,col2\n1,2', 'utf-8')).buffer;
-
-    const zip = new JSZip();
-    zip.file('reference.csv', 'col1,col2\n3,4');
-    referenceZipBuffer = await zip.generateAsync({ type: 'uint8array' });
-
-    if (typeof TextDecoder === 'undefined') {
-      global.TextDecoder = require('util').TextDecoder;
-    }
-
-    const xmlResponse = (body) => new Response(body, { status: 200, headers: { 'Content-Type': 'application/xml' } });
-
-    global.fetch = jest.fn(async (input) => {
+  beforeEach(() => {
+    SearchWorkerClient.__reset();
+    global.fetch = jest.fn((input) => {
       const url = typeof input === 'string' ? input : input.url;
-
-      if (url.includes('prefix=versioned_terminology%2F') && url.includes('delimiter=%2F')) {
-        return xmlResponse(terminologyListing);
+      if (url.endsWith('datasets.json') || url === datasetIndexUrl || url === datasetIndexAbsoluteUrl) {
+        const response = new window.Response(JSON.stringify(datasetIndex), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+        Object.defineProperty(response, 'url', { value: datasetIndexAbsoluteUrl });
+        return Promise.resolve(response);
       }
-
-      if (url.includes('prefix=versioned_provider_data%2F') && url.includes('delimiter=%2F')) {
-        return xmlResponse(providerListing);
+      if (url.endsWith('manifest.json')) {
+        const response = new window.Response(JSON.stringify(manifest), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+        const manifestUrl = new URL('./sample/manifest.json', datasetIndexAbsoluteUrl).toString();
+        Object.defineProperty(response, 'url', { value: manifestUrl });
+        return Promise.resolve(response);
       }
-
-      if (url.includes('prefix=versioned_value_sets%2F') && url.includes('delimiter=%2F')) {
-        return xmlResponse(valueSetsListing);
+      if (url.endsWith('preview.json')) {
+        const response = new window.Response(JSON.stringify(preview), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+        const previewUrl = new URL('./sample/preview.json', datasetIndexAbsoluteUrl).toString();
+        Object.defineProperty(response, 'url', { value: previewUrl });
+        return Promise.resolve(response);
       }
-
-      if (url.includes('prefix=versioned_terminology%2F0.14.2%2F')) {
-        return xmlResponse(terminologyFilesListing);
-      }
-
-      if (url.includes('prefix=versioned_provider_data%2F0.14.2%2F')) {
-        return xmlResponse(providerFilesListing);
-      }
-
-      if (url.includes('prefix=versioned_value_sets%2F2023.01%2F')) {
-        return xmlResponse(valueSetsFilesListing);
-      }
-
-      if (url.includes('prefix=reference-data%2F')) {
-        return xmlResponse(referenceListing);
-      }
-
-      if (url.includes('versioned_terminology/0.14.2/admit_source.csv_0_0_0.csv.gz')) {
-        return new Response(csvBuffer, { status: 200 });
-      }
-
-      if (url.includes('versioned_value_sets/2023.01/value_set.csv.gz')) {
-        return new Response(csvBuffer, { status: 200 });
-      }
-
-      if (url.includes('reference-data/reference.zip')) {
-        return new Response(referenceZipBuffer, { status: 200 });
-      }
-
-      return new Response('', { status: 404 });
+      return Promise.resolve(new window.Response('', { status: 404 }));
     });
   });
 
   afterEach(() => {
     jest.resetAllMocks();
+    SearchWorkerClient.__reset();
   });
 
-  it('renders terminology data with versions and files', async () => {
+  it('renders preview data after loading manifest', async () => {
     render(<CSVViewer />);
 
     await waitFor(() => expect(global.fetch).toHaveBeenCalled());
 
-    const terminologyTab = await screen.findByRole('tab', { name: /terminology/i });
-    expect(terminologyTab).toHaveAttribute('aria-selected', 'true');
-
-    const select = await screen.findByLabelText(/terminology version/i);
-    const versionOption = await screen.findByRole('option', { name: '0.14.2' });
-
-    expect(select).toBeEnabled();
-    expect(versionOption).toBeInTheDocument();
-    expect(Array.from(select.querySelectorAll('option')).map((option) => option.value)).toContain('latest');
-
-    const friendlyLabels = await screen.findAllByText('Admit Source');
-    expect(friendlyLabels.length).toBeGreaterThan(0);
-    expect(await screen.findByRole('button', { name: 'admit_source.csv_0_0_0.csv.gz' })).toBeInTheDocument();
-
-    const downloadLink = await screen.findByRole('link', { name: /download/i });
-    expect(downloadLink).toHaveAttribute('href', expect.stringContaining('versioned_terminology/0.14.2/admit_source.csv_0_0_0.csv.gz'));
+    expect(await screen.findByLabelText(/dataset/i)).toBeInTheDocument();
+    expect(await screen.findByText('Alpha Clinic')).toBeInTheDocument();
+    expect(await screen.findByText('Beta Health')).toBeInTheDocument();
   });
 
-  it('allows switching to value sets and loads data', async () => {
-    const user = userEvent.setup();
+  it('executes search and displays streamed results', async () => {
     render(<CSVViewer />);
 
-    await screen.findByLabelText(/terminology version/i);
+    await waitFor(() => expect(screen.getByLabelText(/dataset/i)).toBeInTheDocument());
+    await screen.findByText('Alpha Clinic');
 
-    await user.click(await screen.findByRole('tab', { name: /value sets/i }));
+    const searchInput = screen.getByRole('searchbox');
+    await userEvent.clear(searchInput);
+    await userEvent.type(searchInput, 'Zeta');
 
-    const valueSetSelect = await screen.findByLabelText(/value set version/i);
-    expect(valueSetSelect).toBeInTheDocument();
+    // Allow debounce window
+    await new Promise((resolve) => setTimeout(resolve, 250));
 
-    await waitFor(() => expect(global.fetch).toHaveBeenCalledWith(
-      expect.stringContaining('prefix=versioned_value_sets%2F'),
-      expect.objectContaining({ headers: expect.any(Object) })
-    ));
+    const client = SearchWorkerClient.__getLatestInstance();
+    expect(client).toBeTruthy();
+    const [requestId] = Array.from(client.requestHandlers.keys());
 
-    const friendlyLabel = await screen.findByText('Value Set');
-    expect(friendlyLabel).toBeInTheDocument();
+    client.emitPartial(requestId, {
+      items: [
+        {
+          rowid: 42,
+          code: '9999',
+          name: 'Zeta Clinic',
+          city: 'Boise',
+        },
+      ],
+      total: 1,
+      bytesFetched: 8192,
+      elapsedMs: 120,
+      shardsSearched: [0],
+    });
 
-    const downloadLink = await screen.findByRole('link', { name: /download/i });
-    expect(downloadLink).toHaveAttribute('href', expect.stringContaining('versioned_value_sets/2023.01/value_set.csv.gz'));
-  });
+    client.resolve(requestId, {
+      items: [
+        {
+          rowid: 42,
+          code: '9999',
+          name: 'Zeta Clinic',
+          city: 'Boise',
+        },
+      ],
+      total: 1,
+      bytesFetched: 8192,
+      elapsedMs: 120,
+      shardsSearched: [0],
+    });
 
-  it('loads reference data without versions', async () => {
-    const user = userEvent.setup();
-    render(<CSVViewer />);
-
-    await screen.findByLabelText(/terminology version/i);
-
-    await user.click(await screen.findByRole('tab', { name: /reference data/i }));
-
-    await waitFor(() => expect(global.fetch).toHaveBeenCalledWith(
-      expect.stringContaining('prefix=reference-data%2F'),
-      expect.objectContaining({ headers: expect.any(Object) })
-    ));
-
-    await waitFor(() => expect(screen.queryByLabelText(/version/i)).toBeNull());
-    expect(await screen.findByText('Available Files')).toBeInTheDocument();
-    expect(await screen.findByRole('button', { name: /reference\.zip/i })).toBeInTheDocument();
-    expect(await screen.findByText('col1')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /shapes\.zip/i })).not.toBeInTheDocument();
-
-    const downloadLink = await screen.findByRole('link', { name: /download/i });
-    expect(downloadLink).toHaveAttribute('href', expect.stringContaining('reference-data/reference.zip'));
+    await waitFor(() => expect(screen.getByText('Zeta Clinic')).toBeInTheDocument());
+    expect(screen.queryByText('Alpha Clinic')).not.toBeInTheDocument();
   });
 });

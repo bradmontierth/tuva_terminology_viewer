@@ -3,3 +3,4 @@ data/
 
 # generated viewer assets
 csv_viewer_app/public/data/
+csv_viewer_app/public/sqljs/

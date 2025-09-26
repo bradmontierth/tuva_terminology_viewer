@@ -11,6 +11,16 @@ This viewer now hydrates CSV headers from the Tuva dbt project so that the data 
 - Set `TUVA_REPO_URL`, `TUVA_REPO_DIR`, or `TUVA_CROSSWALK_OUTPUT` to override the default source repository, cache location, or output file.
 - When working without network access, generate the crosswalk once manually (or copy an existing JSON file) and reuse it locally via `TUVA_CROSSWALK_SKIP_FETCH=1`.
 
+## SQLite search bundles
+
+- `npm run build:sqlite -- --input <path/to/dataset.csv[.gz]> --dataset <id>` prepares the SQLite/FTS artefacts used by the worker. The command supports gzipped Tuva exports out of the box and writes the output under `public/data/sqlite/<datasetId>/` while refreshing `public/data/sqlite/datasets.json`.
+- `python scripts/build-sqlite-batch.py <source>` scans an entire folder (for example `../data/versioned_terminology/latest`) and invokes the builder for every dataset whose row-count exceeds the preview threshold. Files ending in `_compressed` are skipped automatically because they duplicate the canonical exports.
+- `python scripts/sync-sqlite-assets.py <sources...>` syncs the published bundle set down from S3 (`s3://tuva-public-resources/terminology_viewer_sqlite` by default), runs the batch builder, and pushes refreshed artefacts back to the same prefix. Add `--download-only` to hydrate the local cache without rebuilding, or `--skip-download` / `--skip-upload` to control each sync direction.
+- Column headers come from `public/data/header-crosswalk.json` when available; pass `--crosswalk` if you need to point at a different file.
+- Sharding is automatic once the estimated shard size exceeds ~120 MB. Override with `--max-shard-bytes`, `--shard-count`, or `--shard-key` if you need deterministic splits.
+- Preview payloads can be disabled with `--skip-preview` or resized with `--preview-limit`.
+- `npm run prepare:sqlite-assets` stages the `sql.js` wasm and worker bundles into `public/sqljs/`; this runs automatically before `npm start`, `npm test`, and `npm run build`.
+
 ## Available Scripts
 
 In the project directory, you can run:
