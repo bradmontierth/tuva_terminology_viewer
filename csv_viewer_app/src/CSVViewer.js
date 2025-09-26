@@ -184,7 +184,6 @@ function CSVViewer() {
         datasetId: currentManifest.datasetId,
         manifestUrl,
         manifest: currentManifest,
-        bytesBudget: 12 * 1024 * 1024,
       });
       if (workerInitVersionRef.current === initVersion) {
         setSearchError(null);

@@ -4,7 +4,7 @@ self.importScripts('../sqljs/sqljs-httpvfs.js');
 const MAX_RESULTS = 50;
 const FIRST_BATCH_SIZE = 20;
 const DEFAULT_PAGE_SIZE = 4096;
-const DEFAULT_BYTES_BUDGET = 12 * 1024 * 1024; // 12 MB
+const DEFAULT_BYTES_BUDGET = Number.POSITIVE_INFINITY; // unlimited unless caller provides a finite cap
 
 const TOKEN_NORMALIZE_REGEX = /[^a-z0-9\-._\s]+/g;
 const DIACRITIC_REGEX = /[\u0300-\u036f]/g;

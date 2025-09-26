@@ -24,7 +24,7 @@ const fetchAndCache = async (event) => {
 
   const networkPromise = fetch(request.clone())
     .then((response) => {
-      if (response && response.ok) {
+      if (response && response.ok && !request.headers.has('range') && response.status !== 206) {
         const responseClone = response.clone();
         event.waitUntil(cache.put(cacheKey, responseClone));
       }
