@@ -57,7 +57,7 @@
     "gh-pages": "^6.3.0",
     "js-yaml": "^4.1.0",
     "sql.js": "^1.11.0",
-    "sql.js-httpvfs": "^0.7.7",
+    "sql.js-httpvfs": "^0.7.6",
     "xxhash-wasm": "^1.1.0"
   }
 }
