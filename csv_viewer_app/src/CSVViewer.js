@@ -634,6 +634,7 @@ export default function CSVViewer() {
           }
 
           sqliteCatalogRef.current = datasetMap;
+          console.log('SQLite Catalog:', datasetMap);
           setSqliteCatalogError(null);
           setSqliteCatalogVersion((value) => value + 1);
           return;
@@ -1288,7 +1289,7 @@ export default function CSVViewer() {
         contentsNodes.forEach((node) => {
           const keyNode = getElementsByTag(node, 'Key')[0];
           const keyText = keyNode?.textContent || '';
-          if (!keyText || keyText.endsWith('/')) {
+          if (!keyText || keyText.endsWith('/') || keyText.includes('_compressed')) {
             return;
           }
           if (excludedPrefixes.some((prefix) => keyText.startsWith(prefix))) {
@@ -1548,7 +1549,7 @@ export default function CSVViewer() {
 
   // This effect will trigger whenever terminologyVersion or currentFileName changes
   useEffect(() => {
-    if (!currentFileUrl) {
+    if (!currentFileUrl || sqliteEntry) {
       return;
     }
     if (searchMode === 'sqlite') {
@@ -1557,7 +1558,7 @@ export default function CSVViewer() {
     fetchAndProcessCSV(currentFileUrl, currentFileName || '');
     // Reset pagination when URL changes
     setCurrentPage(1);
-  }, [currentFileUrl, currentFileName, fetchAndProcessCSV, searchMode]);
+  }, [currentFileUrl, currentFileName, fetchAndProcessCSV, searchMode, sqliteEntry]);
 
   const handleGroupSelect = (groupId) => {
     const group = fileGroups.find((item) => item.id === groupId);
@@ -1702,13 +1703,16 @@ export default function CSVViewer() {
       if (searchSummary) {
         return `Showing ${searchSummary.returned.toLocaleString()} of ${searchSummary.total.toLocaleString()} matches`;
       }
+      if (manifest?.rowCount) {
+        return `Showing ${csvData.length.toLocaleString()} preview rows of ${manifest.rowCount.toLocaleString()} total`;
+      }
       return `Preview rows: ${csvData.length.toLocaleString()} (partial)`;
     }
     if (isPartialData) {
       return `Partial load: ${csvData.length.toLocaleString()} rows`;
     }
     return `Total rows: ${csvData.length.toLocaleString()}`;
-  }, [csvData.length, isPartialData, isSqliteMode, searchSummary]);
+  }, [csvData.length, isPartialData, isSqliteMode, searchSummary, manifest]);
 
   return (
     <div style={{

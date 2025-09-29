@@ -221,8 +221,8 @@ async function openShard(shardIndex) {
     message: `opening shard ${shardIndex}: ${virtualFilename} from ${fileUrl}`,
   });
 
-  const workerUrl = resolveUrl('sqljs/sqlite.worker.js', state.assetBaseUrl);
-  const wasmUrl = resolveUrl('sqljs/sql-wasm.wasm', state.assetBaseUrl);
+  const workerUrl = resolveUrl('../sqljs/sqlite.worker.js', state.assetBaseUrl);
+  const wasmUrl = resolveUrl('../sqljs/sql-wasm.wasm', state.assetBaseUrl);
 
   const config = {
     virtualFilename,
@@ -313,7 +313,7 @@ async function queryShard(shardIndex, normalizedQuery, limit) {
 
   const uniqueRowIds = Array.from(new Set(rowIds));
   const orderMap = new Map(uniqueRowIds.map((value, index) => [value, index]));
-  const rawSql = `SELECT rowid, ${narrowColumns.map((column) => quoteIdentifier(column)).join(', ')} FROM t_raw WHERE rowid IN (${uniqueRowIds.join(',')});`;
+  const rawSql = `SELECT rowid, ${narrowColumns.map((column) => quoteIdentifier(column)).join(', ')} FROM t_raw WHERE rowid IN (${uniqueRowIds.join(',')}) LIMIT ${limit};`;
   const rawRows = rowsFromExec(await db.exec(rawSql));
   rawRows.sort((a, b) => {
     const aIndex = orderMap.get(a.rowid) ?? 0;
