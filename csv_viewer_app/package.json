@@ -8,6 +8,7 @@
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^13.5.0",
+    "better-sqlite3": "^11.5.0",
     "http-proxy-middleware": "^3.0.5",
     "jszip": "^3.10.1",
     "lucide-react": "^0.507.0",
@@ -20,9 +21,13 @@
   },
   "scripts": {
     "generate:crosswalk": "node scripts/generateHeaderCrosswalk.js",
-    "prestart": "npm run generate:crosswalk",
-    "prebuild": "npm run generate:crosswalk",
-    "pretest": "npm run generate:crosswalk",
+    "prepare:sqlite-assets": "node scripts/prepareSqliteAssets.js",
+    "build:sqlite": "node scripts/build-sqlite.js",
+    "build:sqlite:batch": "python3 scripts/build-sqlite-batch.py",
+    "sync:sqlite-assets": "python3 scripts/sync-sqlite-assets.py",
+    "prestart": "npm run generate:crosswalk && npm run prepare:sqlite-assets",
+    "prebuild": "npm run generate:crosswalk && npm run prepare:sqlite-assets",
+    "pretest": "npm run generate:crosswalk && npm run prepare:sqlite-assets",
     "start": "react-scripts start",
     "build": "react-scripts build",
     "test": "react-scripts test",
@@ -50,6 +55,9 @@
   },
   "devDependencies": {
     "gh-pages": "^6.3.0",
-    "js-yaml": "^4.1.0"
+    "js-yaml": "^4.1.0",
+    "sql.js": "^1.11.0",
+    "sql.js-httpvfs": "^0.7.7",
+    "xxhash-wasm": "^1.1.0"
   }
 }
