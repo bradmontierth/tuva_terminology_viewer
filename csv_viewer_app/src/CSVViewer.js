@@ -3,8 +3,57 @@ import { Search, Download, FileText, Loader2 } from 'lucide-react';
 import * as Papa from 'papaparse';
 import pako from 'pako';
 import JSZip from 'jszip';
+import SearchWorkerClient from './lib/SearchWorkerClient';
+import headerCrosswalkFallback from './generated/headerCrosswalk.json';
+
+const normalizeKey = (value = '') => value.trim().toLowerCase();
+
+const arraysEqual = (a = [], b = []) => {
+  if (a === b) {
+    return true;
+  }
+
+  if (!Array.isArray(a) || !Array.isArray(b)) {
+    return false;
+  }
+
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) {
+      return false;
+    }
+  }
+
+  return true;
+};
 
 const CSV_TEXT_LIMIT = 5000000; // 5MB of text before limiting rows
+const SQLITE_SEARCH_RESULT_LIMIT = 50;
+const SQLITE_BYTES_BUDGET = 32 * 1024 * 1024; // 32MB default cache budget
+
+const formatHeader = (value) => {
+  if (!value) {
+    return '';
+  }
+  return value
+    .replace(/_/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
+};
+
+const useDebouncedValue = (value, delay) => {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+  return debounced;
+};
 
 const isZipFileName = (fileName = '') => fileName.toLowerCase().endsWith('.zip');
 
@@ -41,6 +90,30 @@ const extractCsvFromZip = async (arrayBuffer, preferredName = '') => {
   const targetEntry = matchedEntry || csvEntries[0];
   const csvString = await targetEntry.async('string');
   return { csvString, entryName: targetEntry.name };
+};
+
+const deriveDatasetId = (fileName) => {
+  if (!fileName) {
+    return null;
+  }
+  let base = fileName;
+  if (base.endsWith('.gz')) {
+    base = base.slice(0, -3);
+  }
+  if (base.endsWith('.zip')) {
+    base = base.slice(0, -4);
+  }
+  while (base.endsWith('.csv')) {
+    base = base.slice(0, -4);
+  }
+  const chunkMatch = base.match(/(.+?)_\d+_\d+_\d+$/);
+  if (chunkMatch) {
+    base = chunkMatch[1];
+  }
+  if (base.endsWith('.csv')) {
+    base = base.slice(0, -4);
+  }
+  return base || null;
 };
 
 export default function CSVViewer() {
@@ -90,6 +163,14 @@ export default function CSVViewer() {
 
   const [csvData, setCsvData] = useState([]);
   const [headers, setHeaders] = useState([]);
+  const [columnCount, setColumnCount] = useState(0);
+  const [defaultHeaders, setDefaultHeaders] = useState([]);
+  const [headerCrosswalk, setHeaderCrosswalk] = useState(() => {
+    if (headerCrosswalkFallback && typeof headerCrosswalkFallback === 'object') {
+      return headerCrosswalkFallback;
+    }
+    return null;
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [currentFileName, setCurrentFileName] = useState(null);
@@ -108,8 +189,24 @@ export default function CSVViewer() {
   const [versionLoadError, setVersionLoadError] = useState(null);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [fileLoadError, setFileLoadError] = useState(null);
+  const debouncedFilterTerm = useDebouncedValue(filterTerm, 250);
+  const [searchMode, setSearchMode] = useState('inMemory');
+  const [searchStatus, setSearchStatus] = useState('idle');
+  const [searchError, setSearchError] = useState(null);
+  const [searchSummary, setSearchSummary] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState(null);
+  const [manifest, setManifest] = useState(null);
+  const [manifestUrl, setManifestUrl] = useState(null);
+  const [sqliteCatalogError, setSqliteCatalogError] = useState(null);
+  const [sqliteCatalogVersion, setSqliteCatalogVersion] = useState(0);
+  const [sqlitePreview, setSqlitePreview] = useState({ columns: [], rows: [], generatedAt: null });
   const userSelectedVersionRef = useRef(false);
   const listingBaseRef = useRef(null);
+  const workerClientRef = useRef(null);
+  const workerInitVersionRef = useRef(0);
+  const latestSearchRequestRef = useRef(null);
+  const sqliteCatalogRef = useRef(new Map());
 
   const activeCategory = useMemo(
     () => dataCategories.find((category) => category.id === activeCategoryId) || dataCategories[0],
@@ -121,6 +218,116 @@ export default function CSVViewer() {
   );
   const hasVersionedSources = versionedSources.length > 0;
 
+  const currentDatasetId = useMemo(() => deriveDatasetId(currentFileName), [currentFileName]);
+  const sqliteEntry = useMemo(() => {
+    if (!currentDatasetId) {
+      return null;
+    }
+    return sqliteCatalogRef.current.get(currentDatasetId) || null;
+  }, [currentDatasetId, sqliteCatalogVersion]);
+
+  const initializeWorker = useCallback(async (manifestPayload, manifestHref) => {
+    if (!manifestPayload || !manifestHref) {
+      return;
+    }
+
+    if (!workerClientRef.current) {
+      workerClientRef.current = new SearchWorkerClient();
+    }
+
+    const initVersion = workerInitVersionRef.current + 1;
+    workerInitVersionRef.current = initVersion;
+
+    try {
+      await workerClientRef.current.init({
+        datasetId: manifestPayload.datasetId,
+        manifestUrl: manifestHref,
+        manifest: manifestPayload,
+        bytesBudget: SQLITE_BYTES_BUDGET,
+      });
+      if (workerInitVersionRef.current === initVersion) {
+        setSearchError(null);
+      }
+    } catch (initError) {
+      if (workerInitVersionRef.current === initVersion) {
+        setSearchError(initError.message || 'Failed to initialise search backend.');
+      }
+    }
+  }, []);
+
+  const executeSqliteSearch = useCallback((query) => {
+    if (searchMode !== 'sqlite' || !manifest || !workerClientRef.current) {
+      return;
+    }
+
+    const trimmed = query.trim();
+    if (!trimmed) {
+      latestSearchRequestRef.current = null;
+      setSearchStatus('idle');
+      setSearchError(null);
+      setSearchSummary(null);
+      setCsvData(sqlitePreview.rows);
+      setColumnCount(sqlitePreview.columns.length);
+      setDefaultHeaders(sqlitePreview.columns.map((name, index) => (name ? formatHeader(name) : `Column ${index + 1}`)));
+      setIsPartialData(true);
+      return;
+    }
+
+    const client = workerClientRef.current;
+    if (!client) {
+      return;
+    }
+
+    setSearchStatus('loading');
+    setSearchError(null);
+
+    const { requestId, promise } = client.search(trimmed, {
+      limit: SQLITE_SEARCH_RESULT_LIMIT,
+    });
+    latestSearchRequestRef.current = requestId;
+
+    promise
+      .then((data) => {
+        if (latestSearchRequestRef.current !== data.requestId) {
+          return;
+        }
+
+        const baseColumns = sqlitePreview.columns.length
+          ? sqlitePreview.columns
+          : (Array.isArray(manifest.narrowColumns) ? manifest.narrowColumns : []);
+        const sampleItem = data.items?.[0] || {};
+        const dynamicColumns = Object.keys(sampleItem).filter((key) => key !== 'rowid');
+        const effectiveColumns = baseColumns.length ? baseColumns : dynamicColumns;
+        const fallback = effectiveColumns.map((name, index) => (name ? formatHeader(name) : `Column ${index + 1}`));
+
+        const rows = Array.isArray(data.items)
+          ? data.items.map((item) => effectiveColumns.map((column) => item?.[column] ?? null))
+          : [];
+
+        setDefaultHeaders(fallback);
+        setColumnCount(effectiveColumns.length);
+        setCsvData(rows);
+        setCurrentPage(1);
+        setIsPartialData(typeof data.total === 'number' ? data.total > rows.length : true);
+        setSearchStatus('ready');
+        setSearchSummary({
+          total: typeof data.total === 'number' ? data.total : rows.length,
+          returned: rows.length,
+          elapsedMs: data.elapsedMs ?? null,
+          bytesFetched: data.bytesFetched ?? null,
+        });
+      })
+      .catch((error) => {
+        if (latestSearchRequestRef.current !== requestId) {
+          return;
+        }
+        setSearchError(error.message || 'Search failed.');
+        setSearchStatus('error');
+        setSearchSummary(null);
+        setCsvData([]);
+      });
+  }, [manifest, searchMode, sqlitePreview, setCurrentPage]);
+
   useEffect(() => {
     setFileGroups([]);
     setSelectedGroupId(null);
@@ -128,6 +335,7 @@ export default function CSVViewer() {
     setCurrentFileFolder(activeCategory.sources[0]?.folder || default_folder);
     setCsvData([]);
     setHeaders([]);
+    setDefaultHeaders([]);
     setSearchTerm('');
     setFilterTerm('');
     setCurrentPage(1);
@@ -135,7 +343,318 @@ export default function CSVViewer() {
     setError(null);
     setFileLoadError(null);
     setLoading(false);
+    setSearchStatus('idle');
+    setSearchError(null);
+    setSearchSummary(null);
+    setPreviewError(null);
   }, [activeCategory]);
+
+  useEffect(() => () => {
+    if (workerClientRef.current) {
+      workerClientRef.current.terminate();
+      workerClientRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    latestSearchRequestRef.current = null;
+    if (sqliteEntry) {
+      setSearchMode('sqlite');
+      setSearchStatus('idle');
+      setSearchError(null);
+      setSearchSummary(null);
+      return;
+    }
+
+    setSearchMode('inMemory');
+    setManifest(null);
+    setManifestUrl(null);
+    setSqlitePreview({ columns: [], rows: [], generatedAt: null });
+    setPreviewError(null);
+    setPreviewLoading(false);
+    setSearchStatus('idle');
+    setSearchError(null);
+    setSearchSummary(null);
+  }, [sqliteEntry]);
+
+  useEffect(() => {
+    if (searchMode !== 'sqlite' || !sqliteEntry) {
+      return;
+    }
+
+    let isMounted = true;
+
+    const loadSqliteDataset = async () => {
+      setLoading(true);
+      setPreviewLoading(true);
+      setPreviewError(null);
+      setError(null);
+      setIsPartialData(true);
+      setSearchStatus('idle');
+      setSearchError(null);
+      setSearchSummary(null);
+      setDefaultHeaders([]);
+      setColumnCount(0);
+      setFilterTerm('');
+      setCurrentPage(1);
+
+      try {
+        const response = await fetch(sqliteEntry.manifestUrl, { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error(`Failed to load dataset manifest (${response.status})`);
+        }
+        const payload = await response.json();
+        if (!isMounted) {
+          return;
+        }
+
+        setManifest(payload);
+        setManifestUrl(sqliteEntry.manifestUrl);
+
+        await initializeWorker(payload, sqliteEntry.manifestUrl);
+
+        let previewColumns = Array.isArray(payload.narrowColumns) && payload.narrowColumns.length
+          ? payload.narrowColumns
+          : [];
+        let previewRows = [];
+        let generatedAt = payload.generatedAt || null;
+
+        if (payload.preview?.url) {
+          try {
+            const previewUrl = new URL(payload.preview.url, sqliteEntry.manifestUrl).toString();
+            const previewResponse = await fetch(previewUrl, { cache: 'no-store' });
+            if (!previewResponse.ok) {
+              throw new Error(`Failed to load preview (${previewResponse.status})`);
+            }
+            const previewPayload = await previewResponse.json();
+            if (!isMounted) {
+              return;
+            }
+            if (Array.isArray(previewPayload.columns) && previewPayload.columns.length) {
+              previewColumns = previewPayload.columns;
+            }
+            if (Array.isArray(previewPayload.rows)) {
+              previewRows = previewPayload.rows;
+            }
+            generatedAt = previewPayload.generatedAt || generatedAt;
+          } catch (previewErr) {
+            if (!isMounted) {
+              return;
+            }
+            setPreviewError(previewErr.message || 'Unable to load preview data.');
+          }
+        } else if (Array.isArray(payload.preview?.rows)) {
+          previewRows = payload.preview.rows;
+        }
+
+        const columns = previewColumns.length ? previewColumns : Array.from({ length: previewRows[0]?.length || 0 }, (_, index) => `Column ${index + 1}`);
+        const fallback = columns.map((name, index) => (name ? formatHeader(name) : `Column ${index + 1}`));
+
+        setSqlitePreview({ columns, rows: Array.isArray(previewRows) ? previewRows : [], generatedAt });
+        setDefaultHeaders(fallback);
+        setColumnCount(columns.length);
+        setCsvData(Array.isArray(previewRows) ? previewRows : []);
+        setIsPartialData(true);
+      } catch (manifestError) {
+        if (!isMounted) {
+          return;
+        }
+        setManifest(null);
+        setManifestUrl(null);
+        setSqlitePreview({ columns: [], rows: [], generatedAt: null });
+        setDefaultHeaders([]);
+        setColumnCount(0);
+        setCsvData([]);
+        setSearchError(manifestError.message || 'Unable to load SQLite dataset.');
+        setPreviewError(manifestError.message || 'Unable to load SQLite dataset.');
+      } finally {
+        if (isMounted) {
+          setLoading(false);
+          setPreviewLoading(false);
+        }
+      }
+    };
+
+    loadSqliteDataset();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [initializeWorker, searchMode, sqliteEntry]);
+
+  useEffect(() => {
+    if (searchMode !== 'sqlite' || !manifest) {
+      return;
+    }
+    executeSqliteSearch(debouncedFilterTerm);
+  }, [searchMode, manifest, debouncedFilterTerm, executeSqliteSearch]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const fetchCrosswalk = async () => {
+      const uniquePaths = new Set();
+      const addPath = (base, suffix) => {
+        if (!suffix) {
+          return;
+        }
+        const normalizedBase = base ? base.replace(/\/$/, '') : '';
+        const normalizedSuffix = suffix.startsWith('/') ? suffix : `/${suffix}`;
+        const candidate = `${normalizedBase}${normalizedSuffix}` || normalizedSuffix;
+        if (candidate) {
+          uniquePaths.add(candidate);
+        }
+      };
+
+      try {
+        const publicUrl = typeof process !== 'undefined' ? (process.env?.PUBLIC_URL || '') : '';
+
+        addPath('', '/data/header-crosswalk.json');
+        addPath('', 'data/header-crosswalk.json');
+        addPath(publicUrl, '/data/header-crosswalk.json');
+        addPath(publicUrl, 'data/header-crosswalk.json');
+
+        if (typeof window !== 'undefined') {
+          addPath(window.location.origin, '/data/header-crosswalk.json');
+          addPath(`${window.location.origin}${publicUrl}`, '/data/header-crosswalk.json');
+        }
+
+        let parsed = null;
+        let lastError = null;
+        for (const requestPath of uniquePaths) {
+          try {
+            const response = await fetch(requestPath, { cache: 'no-store' });
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status} ${response.statusText}`);
+            }
+
+            const contentType = response.headers.get('content-type') || '';
+            if (!contentType.includes('json')) {
+              const text = await response.clone().text();
+              if (/^\s*</.test(text)) {
+                throw new Error('Received non-JSON response (likely HTML).');
+              }
+              parsed = JSON.parse(text);
+            } else {
+              parsed = await response.json();
+            }
+
+            break;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+
+        if (!parsed) {
+          throw lastError || new Error('Unable to load header crosswalk map.');
+        }
+
+        if (isMounted) {
+          setHeaderCrosswalk(parsed);
+        }
+      } catch (err) {
+        console.error('Failed to load header crosswalk map', err);
+        if (isMounted) {
+          setHeaderCrosswalk((previous) => (previous && typeof previous === 'object' ? previous : null));
+        }
+      }
+    };
+
+    fetchCrosswalk();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    const seen = new Set();
+    const candidates = [];
+
+    const addCandidate = (value) => {
+      if (!value) {
+        return;
+      }
+      const normalised = value.replace(/\/+$/, '/');
+      const trimmed = normalised.replace(/\/+data\/sqlite\/datasets\.json$/, '');
+      const target = value.endsWith('datasets.json') ? value : `${normalised}data/sqlite/datasets.json`;
+      if (!seen.has(target)) {
+        seen.add(target);
+        candidates.push(target);
+      }
+    };
+
+    const publicUrl = typeof process !== 'undefined' ? (process.env?.PUBLIC_URL || '') : '';
+    const normalisedPublic = publicUrl.replace(/\/$/, '');
+    const origin = typeof window !== 'undefined' ? window.location.origin : '';
+
+    addCandidate('data/sqlite/datasets.json');
+    addCandidate('/data/sqlite/datasets.json');
+    if (normalisedPublic) {
+      addCandidate(`${normalisedPublic}/data/sqlite/datasets.json`);
+      if (origin) {
+        addCandidate(`${origin}${normalisedPublic}/data/sqlite/datasets.json`);
+      }
+    }
+    if (origin) {
+      addCandidate(`${origin}/data/sqlite/datasets.json`);
+    }
+    addCandidate('https://tuva-public-resources.s3.amazonaws.com/terminology_viewer_sqlite/datasets.json');
+
+    const loadCatalog = async () => {
+      let lastError = null;
+      for (const candidate of candidates) {
+        try {
+          const response = await fetch(candidate, { cache: 'no-store' });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status} ${response.statusText}`);
+          }
+          const payload = await response.json();
+          if (!Array.isArray(payload)) {
+            throw new Error('SQLite catalog response is malformed.');
+          }
+
+          const baseUrl = new URL('./', response.url).toString();
+          const datasetMap = new Map();
+          payload.forEach((entry) => {
+            if (!entry || typeof entry !== 'object') {
+              return;
+            }
+            const datasetId = entry.datasetId || entry.id;
+            if (!datasetId || !entry.manifest) {
+              return;
+            }
+            const manifestHref = new URL(entry.manifest, baseUrl).toString();
+            datasetMap.set(datasetId, { ...entry, manifestUrl: manifestHref });
+          });
+
+          if (!isMounted) {
+            return;
+          }
+
+          sqliteCatalogRef.current = datasetMap;
+          setSqliteCatalogError(null);
+          setSqliteCatalogVersion((value) => value + 1);
+          return;
+        } catch (catalogError) {
+          lastError = catalogError;
+        }
+      }
+
+      if (isMounted) {
+        sqliteCatalogRef.current = new Map();
+        setSqliteCatalogError(lastError?.message || 'Unable to load SQLite catalog.');
+        setSqliteCatalogVersion((value) => value + 1);
+      }
+    };
+
+    loadCatalog();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   const determineListingBase = useCallback(() => {
     if (typeof window === 'undefined') {
@@ -229,7 +748,8 @@ export default function CSVViewer() {
   };
 
   const toBaseCsvName = useCallback((fileName = '') => {
-    const normalized = fileName.trim();
+    const normalizedInput = typeof fileName === 'string' ? fileName : '';
+    const normalized = normalizedInput.trim();
     if (!normalized) {
       return '';
     }
@@ -245,6 +765,145 @@ export default function CSVViewer() {
 
     return normalized;
   }, []);
+
+  const isLatestVersion = (value = '') => normalizeKey(value) === 'latest';
+
+  const toVersionParts = (value = '') => {
+    if (!value) {
+      return [];
+    }
+
+    return value
+      .replace(/_/g, '.')
+      .split(/[^0-9A-Za-z]+/)
+      .filter(Boolean)
+      .map((part) => {
+        const numeric = Number(part);
+        return Number.isNaN(numeric) ? part.toLowerCase() : numeric;
+      });
+  };
+
+  const compareVersionStrings = (a = '', b = '') => {
+    if (isLatestVersion(a) && isLatestVersion(b)) {
+      return 0;
+    }
+    if (isLatestVersion(a)) {
+      return 1;
+    }
+    if (isLatestVersion(b)) {
+      return -1;
+    }
+
+    const aParts = toVersionParts(a);
+    const bParts = toVersionParts(b);
+    const maxLength = Math.max(aParts.length, bParts.length);
+
+    for (let index = 0; index < maxLength; index += 1) {
+      const aPart = aParts[index] ?? 0;
+      const bPart = bParts[index] ?? 0;
+
+      if (aPart === bPart) {
+        continue;
+      }
+
+      if (typeof aPart === 'string' || typeof bPart === 'string') {
+        const aString = String(aPart);
+        const bString = String(bPart);
+        if (aString > bString) {
+          return 1;
+        }
+        if (aString < bString) {
+          return -1;
+        }
+        continue;
+      }
+
+      if (aPart > bPart) {
+        return 1;
+      }
+      if (aPart < bPart) {
+        return -1;
+      }
+    }
+
+    return 0;
+  };
+
+  const resolveVersionMap = (folderMap, requestedVersion) => {
+    if (!folderMap || typeof folderMap !== 'object') {
+      return null;
+    }
+
+    const normalizedRequested = requestedVersion?.trim() || '';
+    const directMatch = folderMap[normalizedRequested] || folderMap[normalizeKey(normalizedRequested)];
+    if (directMatch && typeof directMatch === 'object') {
+      return { versionKey: normalizedRequested, map: directMatch, isFallback: false };
+    }
+
+    const versionKeys = Object.keys(folderMap);
+    if (!versionKeys.length) {
+      return null;
+    }
+
+    const sortedKeys = versionKeys.slice().sort((a, b) => compareVersionStrings(b, a));
+    const bestKey = sortedKeys.find((key) => compareVersionStrings(key, normalizedRequested) <= 0)
+      || sortedKeys[0];
+
+    const map = folderMap[bestKey];
+    if (!map || typeof map !== 'object') {
+      return null;
+    }
+
+    if (bestKey !== normalizedRequested) {
+      console.warn('Crosswalk missing version, using fallback', {
+        requestedVersion: normalizedRequested,
+        fallbackVersion: bestKey,
+      });
+    }
+
+    return { versionKey: bestKey, map, isFallback: bestKey !== normalizedRequested };
+  };
+
+  const resolveCrosswalkEntry = (folder, version, fileName) => {
+    if (!headerCrosswalk || typeof headerCrosswalk !== 'object') {
+      return null;
+    }
+
+    const normalizedFolder = normalizeKey(folder);
+    const baseName = normalizeKey(toBaseCsvName(fileName));
+    const requestedVersion = version || '';
+
+    if (!normalizedFolder || !baseName) {
+      return null;
+    }
+
+    const folderMap = headerCrosswalk[normalizedFolder];
+    if (!folderMap || typeof folderMap !== 'object') {
+      return null;
+    }
+
+    const versionResult = resolveVersionMap(folderMap, requestedVersion);
+    if (!versionResult) {
+      return null;
+    }
+
+    const { map: versionMap, versionKey, isFallback } = versionResult;
+    const entry = versionMap[baseName];
+
+    if (!entry) {
+      return null;
+    }
+
+    if (Array.isArray(entry)) {
+      return { headers: entry, _resolvedVersion: versionKey, _isFallbackVersion: isFallback };
+    }
+
+    if (entry && Array.isArray(entry.headers)) {
+      return { ...entry, _resolvedVersion: versionKey, _isFallbackVersion: isFallback };
+    }
+
+    return null;
+  };
 
   const toFriendlyLabel = useCallback((csvName = '') => {
     const base = csvName.replace(/\.csv$/i, '');
@@ -717,42 +1376,43 @@ export default function CSVViewer() {
   // Helper function to process CSV string and update state
   const processCsvString = useCallback((csvString, isPartial = false, forceLimit = false) => {
     if (!csvString.trim()) {
-      throw new Error("CSV file is empty");
+      throw new Error('CSV file is empty');
     }
 
-    // Determine if we should limit rows based on file size or if it's partial data
-    const shouldLimitRows = isPartial || forceLimit || csvString.length > 2000000; // 2MB threshold
+    const shouldLimitRows = isPartial || forceLimit || csvString.length > CSV_TEXT_LIMIT;
 
     Papa.parse(csvString, {
       header: false,
-      dynamicTyping: false, // Disable dynamic typing to preserve string values
+      dynamicTyping: false,
       skipEmptyLines: true,
-      preview: shouldLimitRows ? 50000 : 0, // 0 means parse all rows
+      preview: shouldLimitRows ? 50000 : 0,
       complete: (results) => {
-        if (results.data && results.data.length > 0) {
+        if (Array.isArray(results.data) && results.data.length > 0) {
           setCsvData(results.data);
-
-          // Determine if this is actually partial data
-          const actuallyPartial = isPartial || (shouldLimitRows && results.meta.truncated);
+          const actuallyPartial = isPartial || (shouldLimitRows && results.meta?.truncated);
           setIsPartialData(actuallyPartial);
 
-          // Generate column placeholders based on the number of columns in the first row
-          if (results.data[0] && Array.isArray(results.data[0])) {
-            const columnCount = results.data[0].length;
-            const placeholderHeaders = Array.from({ length: columnCount }, (_, i) => `Column ${i + 1}`);
-            setHeaders(placeholderHeaders);
-          } else {
+          const firstRow = Array.isArray(results.data[0]) ? results.data[0] : null;
+          const detectedCount = firstRow ? firstRow.length : 0;
+          setColumnCount(detectedCount);
+          setDefaultHeaders(Array.from({ length: detectedCount }, (_, index) => `Column ${index + 1}`));
+
+          if (!detectedCount) {
             setError('Unable to determine column structure');
           }
         } else {
+          setColumnCount(0);
+          setDefaultHeaders([]);
           setError('No rows found in the CSV file');
         }
         setLoading(false);
       },
-      error: (error) => {
-        setError(`Error parsing CSV: ${error.message}`);
+      error: (parseError) => {
+        setError(`Error parsing CSV: ${parseError.message}`);
+        setColumnCount(0);
+        setDefaultHeaders([]);
         setLoading(false);
-      }
+      },
     });
   }, []);
 
@@ -797,12 +1457,14 @@ export default function CSVViewer() {
 
         } catch (textReadError) {
           setError(`Unable to process this file format: ${textReadError.message}`);
+          setColumnCount(0);
           setLoading(false);
         }
       }
 
     } catch (err) {
       setError(`Error fetching partial data: ${err.message}`);
+      setColumnCount(0);
       setLoading(false);
     }
   }, [processCsvString]);
@@ -810,6 +1472,9 @@ export default function CSVViewer() {
   const fetchAndProcessCSV = useCallback(async (url, fileName = '') => {
     setLoading(true);
     setError(null);
+    setColumnCount(0);
+    setHeaders([]);
+    setDefaultHeaders([]);
     try {
       const response = await fetch(url);
 
@@ -831,6 +1496,7 @@ export default function CSVViewer() {
         } catch (zipError) {
           setError(`Unable to extract ZIP archive: ${zipError.message}`);
           setLoading(false);
+          setColumnCount(0);
           return;
         }
       }
@@ -873,6 +1539,7 @@ export default function CSVViewer() {
 
     } catch (err) {
       setError(`Error: ${err.message}`);
+      setColumnCount(0);
       setLoading(false);
     }
   }, [fetchPartialCSV, processCsvString]);
@@ -884,10 +1551,13 @@ export default function CSVViewer() {
     if (!currentFileUrl) {
       return;
     }
+    if (searchMode === 'sqlite') {
+      return;
+    }
     fetchAndProcessCSV(currentFileUrl, currentFileName || '');
     // Reset pagination when URL changes
     setCurrentPage(1);
-  }, [currentFileUrl, currentFileName, fetchAndProcessCSV]);
+  }, [currentFileUrl, currentFileName, fetchAndProcessCSV, searchMode]);
 
   const handleGroupSelect = (groupId) => {
     const group = fileGroups.find((item) => item.id === groupId);
@@ -925,6 +1595,44 @@ export default function CSVViewer() {
     // The useEffect will automatically trigger and reload the current file with the new version
   };
 
+  useEffect(() => {
+    if (!columnCount) {
+      setHeaders((previous) => (previous.length ? [] : previous));
+      return;
+    }
+
+    const entry = resolveCrosswalkEntry(currentFileFolder, terminologyVersion, currentFileName);
+    const fallbackHeaders = Array.from({ length: columnCount }, (_, index) => {
+      const candidate = defaultHeaders[index];
+      return candidate ?? `Column ${index + 1}`;
+    });
+
+    let nextHeaders = fallbackHeaders;
+
+    if (entry && Array.isArray(entry.headers)) {
+      if (entry.headers.length !== columnCount) {
+        console.warn('Crosswalk headers length mismatch', {
+          folder: currentFileFolder,
+          version: terminologyVersion,
+          file: currentFileName,
+          expected: columnCount,
+          received: entry.headers.length,
+        });
+      }
+
+      nextHeaders = fallbackHeaders.map((defaultLabel, index) => {
+        const candidate = entry.headers[index];
+        if (candidate === null || candidate === undefined) {
+          return defaultLabel;
+        }
+        const label = String(candidate).trim();
+        return label || defaultLabel;
+      });
+    }
+
+    setHeaders((previous) => (arraysEqual(previous, nextHeaders) ? previous : nextHeaders));
+  }, [columnCount, currentFileFolder, currentFileName, defaultHeaders, headerCrosswalk, terminologyVersion]);
+
   const handleCategoryChange = (categoryId) => {
     if (!categoryId || categoryId === activeCategoryId) {
       return;
@@ -952,6 +1660,55 @@ export default function CSVViewer() {
   const filePanelHeading = hasVersionedSources && terminologyVersion
     ? `Available Files - Version ${terminologyVersion}`
     : 'Available Files';
+
+  const isSqliteMode = searchMode === 'sqlite';
+  const normalizedFilterTerm = filterTerm.trim().toLowerCase();
+
+  const filteredData = useMemo(() => {
+    if (isSqliteMode) {
+      return csvData;
+    }
+    if (!normalizedFilterTerm) {
+      return csvData;
+    }
+    return csvData.filter((row) =>
+      row.some((cell) => cell && String(cell).toLowerCase().includes(normalizedFilterTerm))
+    );
+  }, [csvData, isSqliteMode, normalizedFilterTerm]);
+
+  const totalRows = filteredData.length;
+
+  const paginatedRows = useMemo(() => {
+    if (isSqliteMode) {
+      return filteredData;
+    }
+    const start = (currentPage - 1) * pageSize;
+    return filteredData.slice(start, start + pageSize);
+  }, [filteredData, isSqliteMode, currentPage, pageSize]);
+
+  const totalPages = isSqliteMode ? 1 : Math.max(1, Math.ceil(totalRows / pageSize));
+
+  const filterInputPlaceholder = isSqliteMode ? 'Search dataset…' : 'Filter content...';
+  const filterInputDisabled = isSqliteMode ? previewLoading : loading;
+
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages);
+    }
+  }, [currentPage, totalPages]);
+
+  const dataSummaryText = useMemo(() => {
+    if (isSqliteMode) {
+      if (searchSummary) {
+        return `Showing ${searchSummary.returned.toLocaleString()} of ${searchSummary.total.toLocaleString()} matches`;
+      }
+      return `Preview rows: ${csvData.length.toLocaleString()} (partial)`;
+    }
+    if (isPartialData) {
+      return `Partial load: ${csvData.length.toLocaleString()} rows`;
+    }
+    return `Total rows: ${csvData.length.toLocaleString()}`;
+  }, [csvData.length, isPartialData, isSqliteMode, searchSummary]);
 
   return (
     <div style={{
@@ -985,6 +1742,11 @@ export default function CSVViewer() {
             fontWeight: 'bold',
             margin: 0
           }}>Tuva Terminology Viewer</h1>
+          {sqliteCatalogError && (
+            <span style={{ fontSize: '12px', color: '#dc2626' }}>
+              Large dataset search is unavailable: {sqliteCatalogError}
+            </span>
+          )}
           <div
             role="tablist"
             aria-label="Data category"
@@ -1281,10 +2043,8 @@ export default function CSVViewer() {
                 marginTop: '4px',
                 marginBottom: 0
               }}>
-                {isPartialData
-                  ? `Partial load: ${csvData.length} rows`
-                  : `Total rows: ${csvData.length}`}
-                {currentFileUrl ? `, Url: ${currentFileUrl}` : ''}
+                {dataSummaryText}
+                {currentFileUrl ? ` · ${currentFileUrl}` : ''}
               </p>
             )}
           </div>
@@ -1349,11 +2109,11 @@ export default function CSVViewer() {
             <>
               <div style={{
                 position: 'relative',
-                marginBottom: '16px'
+                marginBottom: isSqliteMode ? '8px' : '16px'
               }}>
                 <input
                   type="text"
-                  placeholder="Filter content..."
+                  placeholder={filterInputPlaceholder}
                   style={{
                     width: '100%',
                     padding: '8px 8px 8px 32px',
@@ -1363,6 +2123,7 @@ export default function CSVViewer() {
                   }}
                   value={filterTerm}
                   onChange={(e) => setFilterTerm(e.target.value)}
+                  disabled={filterInputDisabled}
                 />
                 <Search style={{
                   position: 'absolute',
@@ -1374,6 +2135,43 @@ export default function CSVViewer() {
                   height: '16px'
                 }} />
               </div>
+
+              {isSqliteMode && (
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  marginBottom: '12px',
+                  minHeight: '20px'
+                }}>
+                  {searchStatus === 'loading' && (
+                    <Loader2 style={{
+                      width: '16px',
+                      height: '16px',
+                      color: '#3b82f6',
+                      animation: 'spin 1s linear infinite'
+                    }} />
+                  )}
+                  {searchStatus === 'ready' && searchSummary && (
+                    <span style={{ fontSize: '12px', color: '#6b7280' }}>
+                      Showing {searchSummary.returned.toLocaleString()} of {searchSummary.total.toLocaleString()} matches
+                      {typeof searchSummary.elapsedMs === 'number' ? ` (${(searchSummary.elapsedMs / 1000).toFixed(1)}s)` : ''}
+                      {typeof searchSummary.bytesFetched === 'number' ? ` · ${(searchSummary.bytesFetched / (1024 * 1024)).toFixed(2)}MB fetched` : ''}
+                    </span>
+                  )}
+                  {searchStatus === 'idle' && !searchError && !previewError && (
+                    <span style={{ fontSize: '12px', color: '#6b7280' }}>
+                      Showing preview data. Enter a term above to search the full dataset.
+                    </span>
+                  )}
+                  {searchStatus === 'error' && searchError && (
+                    <span style={{ fontSize: '12px', color: '#dc2626' }}>{searchError}</span>
+                  )}
+                  {!searchError && previewError && (
+                    <span style={{ fontSize: '12px', color: '#dc2626' }}>{previewError}</span>
+                  )}
+                </div>
+              )}
               
               <div style={{
                 overflowY: 'auto',
@@ -1407,19 +2205,11 @@ export default function CSVViewer() {
                         >
                           {header}
                         </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {csvData
-                      .filter(row => {
-                        if (!filterTerm) return true;
-                        return row.some(cell => 
-                          cell && String(cell).toLowerCase().includes(filterTerm.toLowerCase())
-                        );
-                      })
-                      .slice((currentPage - 1) * pageSize, currentPage * pageSize)
-                      .map((row, rowIndex) => (
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                    {paginatedRows.length ? paginatedRows.map((row, rowIndex) => (
                       <tr 
                         key={rowIndex}
                         style={{
@@ -1441,7 +2231,20 @@ export default function CSVViewer() {
                           </td>
                         ))}
                       </tr>
-                    ))}
+                    )) : (
+                      <tr>
+                        <td
+                          colSpan={Math.max(headers.length, 1)}
+                          style={{
+                            padding: '16px',
+                            textAlign: 'center',
+                            color: '#6b7280'
+                          }}
+                        >
+                          No data available for this selection.
+                        </td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
                 
@@ -1462,6 +2265,7 @@ export default function CSVViewer() {
                         setPageSize(Number(e.target.value));
                         setCurrentPage(1);
                       }}
+                      disabled={isSqliteMode}
                       style={{
                         padding: '4px 8px',
                         border: '1px solid #d1d5db',
@@ -1477,55 +2281,42 @@ export default function CSVViewer() {
                   </div>
                   
                   <div style={{ display: 'flex', alignItems: 'center' }}>
-                    {(() => {
-                      // Calculate filtered data once to avoid repeated filtering
-                      const filteredData = csvData.filter(row => {
-                        if (!filterTerm) return true;
-                        return row.some(cell => 
-                          cell && String(cell).toLowerCase().includes(filterTerm.toLowerCase())
-                        );
-                      });
-                      const totalPages = Math.ceil(filteredData.length / pageSize) || 1;
-                      
-                      return (
-                        <>
-                          <button
-                            onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
-                            disabled={currentPage === 1}
-                            style={{
-                              padding: '4px 8px',
-                              border: '1px solid #d1d5db',
-                              borderRadius: '4px',
-                              marginRight: '8px',
-                              backgroundColor: currentPage === 1 ? '#f3f4f6' : 'white',
-                              cursor: currentPage === 1 ? 'not-allowed' : 'pointer',
-                              color: currentPage === 1 ? '#9ca3af' : '#111827'
-                            }}
-                          >
-                            Previous
-                          </button>
-                          
-                          <span style={{ margin: '0 8px', fontSize: '14px' }}>
-                            Page {currentPage} of {totalPages}
-                          </span>
-                          
-                          <button
-                            onClick={() => setCurrentPage(prev => Math.min(prev + 1, totalPages))}
-                            disabled={currentPage >= totalPages}
-                            style={{
-                              padding: '4px 8px',
-                              border: '1px solid #d1d5db',
-                              borderRadius: '4px',
-                              backgroundColor: currentPage >= totalPages ? '#f3f4f6' : 'white',
-                              cursor: currentPage >= totalPages ? 'not-allowed' : 'pointer',
-                              color: currentPage >= totalPages ? '#9ca3af' : '#111827'
-                            }}
-                          >
-                            Next
-                          </button>
-                        </>
-                      );
-                    })()}
+                    <>
+                      <button
+                        onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
+                        disabled={isSqliteMode || currentPage === 1}
+                        style={{
+                          padding: '4px 8px',
+                          border: '1px solid #d1d5db',
+                          borderRadius: '4px',
+                          marginRight: '8px',
+                          backgroundColor: (isSqliteMode || currentPage === 1) ? '#f3f4f6' : 'white',
+                          cursor: (isSqliteMode || currentPage === 1) ? 'not-allowed' : 'pointer',
+                          color: (isSqliteMode || currentPage === 1) ? '#9ca3af' : '#111827'
+                        }}
+                      >
+                        Previous
+                      </button>
+
+                      <span style={{ margin: '0 8px', fontSize: '14px' }}>
+                        Page {Math.min(currentPage, totalPages)} of {totalPages}
+                      </span>
+
+                      <button
+                        onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
+                        disabled={isSqliteMode || currentPage >= totalPages}
+                        style={{
+                          padding: '4px 8px',
+                          border: '1px solid #d1d5db',
+                          borderRadius: '4px',
+                          backgroundColor: (isSqliteMode || currentPage >= totalPages) ? '#f3f4f6' : 'white',
+                          cursor: (isSqliteMode || currentPage >= totalPages) ? 'not-allowed' : 'pointer',
+                          color: (isSqliteMode || currentPage >= totalPages) ? '#9ca3af' : '#111827'
+                        }}
+                      >
+                        Next
+                      </button>
+                    </>
                   </div>
                 </div>
               </div>
