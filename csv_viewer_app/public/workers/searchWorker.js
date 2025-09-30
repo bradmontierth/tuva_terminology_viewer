@@ -221,8 +221,8 @@ async function openShard(shardIndex) {
     message: `opening shard ${shardIndex}: ${virtualFilename} from ${fileUrl}`,
   });
 
-  const workerUrl = resolveUrl('../sqljs/sqlite.worker.js', state.assetBaseUrl);
-  const wasmUrl = resolveUrl('../sqljs/sql-wasm.wasm', state.assetBaseUrl);
+  const workerUrl = resolveUrl('sqljs/sqlite.worker.js', state.assetBaseUrl);
+  const wasmUrl = resolveUrl('sqljs/sql-wasm.wasm', state.assetBaseUrl);
 
   const config = {
     virtualFilename,
