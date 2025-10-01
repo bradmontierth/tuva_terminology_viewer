@@ -33,6 +33,108 @@ const arraysEqual = (a = [], b = []) => {
 const CSV_TEXT_LIMIT = 5000000; // 5MB of text before limiting rows
 const SQLITE_SEARCH_RESULT_LIMIT = 50;
 const SQLITE_BYTES_BUDGET = 32 * 1024 * 1024; // 32MB default cache budget
+const DEFAULT_BASE_DOMAIN = 'https://tuva-public-resources.s3.amazonaws.com';
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0']);
+
+const isPrivateIPv4 = (octets) => {
+  if (!Array.isArray(octets) || octets.length !== 4) {
+    return false;
+  }
+  const [a, b] = octets;
+  if (Number.isNaN(a) || Number.isNaN(b)) {
+    return false;
+  }
+  if (a === 10 || a === 127 || a === 0) {
+    return true;
+  }
+  if (a === 192 && b === 168) {
+    return true;
+  }
+  if (a === 172 && b >= 16 && b <= 31) {
+    return true;
+  }
+  return false;
+};
+
+const isLocalHostname = (hostname = '') => {
+  if (!hostname) {
+    return false;
+  }
+
+  const normalised = hostname.trim().toLowerCase();
+  if (!normalised) {
+    return false;
+  }
+
+  if (LOCAL_HOSTNAMES.has(normalised)) {
+    return true;
+  }
+
+  if (normalised.endsWith('.localhost') || normalised.endsWith('.local') || normalised.endsWith('.lan')) {
+    return true;
+  }
+
+  if (normalised.includes(':')) {
+    return normalised === '::1' || normalised.startsWith('fe80:') || normalised.startsWith('fd');
+  }
+
+  const ipv4Match = normalised.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (ipv4Match) {
+    const octets = ipv4Match.slice(1).map((part) => Number(part));
+    return isPrivateIPv4(octets);
+  }
+
+  return false;
+};
+
+const rawPublicUrl = (process.env.PUBLIC_URL || '').trim();
+
+const resolvePublicPath = () => {
+  if (!rawPublicUrl) {
+    return '';
+  }
+
+  const normalise = (value) => value.replace(/\/$/, '');
+
+  try {
+    const base = typeof window !== 'undefined' && window.location
+      ? window.location.origin
+      : 'http://localhost';
+    const absolute = new URL(rawPublicUrl, base);
+    const path = absolute.pathname.replace(/\/+$/, '');
+    return path === '/' ? '' : path;
+  } catch (error) {
+    const withLeading = rawPublicUrl.startsWith('/') ? rawPublicUrl : `/${rawPublicUrl}`;
+    const trimmed = normalise(withLeading);
+    return trimmed === '/' ? '' : trimmed;
+  }
+};
+
+const resolveBaseDomain = () => {
+  const override = (process.env.REACT_APP_DATA_BASE_URL || '').trim();
+  if (override) {
+    try {
+      if (override.startsWith('http://') || override.startsWith('https://')) {
+        return new URL(override).toString().replace(/\/$/, '');
+      }
+      if (typeof window !== 'undefined') {
+        return new URL(override, window.location.origin).toString().replace(/\/$/, '');
+      }
+    } catch (error) {
+      // fall through to returning the raw override without crashing
+    }
+    return override.replace(/\/$/, '');
+  }
+
+  if (typeof window !== 'undefined' && window.location) {
+    const { hostname, origin } = window.location;
+    if (isLocalHostname(hostname)) {
+      return origin.replace(/\/$/, '');
+    }
+  }
+
+  return DEFAULT_BASE_DOMAIN;
+};
 
 const formatHeader = (value) => {
   if (!value) {
@@ -117,7 +219,7 @@ const deriveDatasetId = (fileName) => {
 };
 
 export default function CSVViewer() {
-  const baseDomain = 'https://tuva-public-resources.s3.amazonaws.com';
+  const baseDomain = useMemo(resolveBaseDomain, []);
   const default_folder = 'versioned_terminology';
   const provider_folder = 'versioned_provider_data';
   const value_sets_folder = 'versioned_value_sets';
@@ -586,21 +688,30 @@ export default function CSVViewer() {
     };
 
     const publicUrl = typeof process !== 'undefined' ? (process.env?.PUBLIC_URL || '') : '';
+    const publicPath = resolvePublicPath();
     const normalisedPublic = publicUrl.replace(/\/$/, '');
     const origin = typeof window !== 'undefined' ? window.location.origin : '';
 
+    const prefersLocalCatalog = typeof window !== 'undefined'
+      && isLocalHostname(window.location.hostname);
+
     addCandidate('data/sqlite/datasets.json');
     addCandidate('/data/sqlite/datasets.json');
-    if (normalisedPublic) {
-      addCandidate(`${normalisedPublic}/data/sqlite/datasets.json`);
+    if (publicPath) {
+      addCandidate(publicPath);
       if (origin) {
-        addCandidate(`${origin}${normalisedPublic}/data/sqlite/datasets.json`);
+        addCandidate(`${origin}${publicPath}`);
       }
+    }
+    if (normalisedPublic.startsWith('http://') || normalisedPublic.startsWith('https://')) {
+      addCandidate(normalisedPublic);
     }
     if (origin) {
       addCandidate(`${origin}/data/sqlite/datasets.json`);
     }
-    addCandidate('https://tuva-public-resources.s3.amazonaws.com/terminology_viewer_sqlite/datasets.json');
+    if (!prefersLocalCatalog) {
+      addCandidate('https://tuva-public-resources.s3.amazonaws.com/terminology_viewer_sqlite/datasets.json');
+    }
 
     const loadCatalog = async () => {
       let lastError = null;
@@ -662,22 +773,21 @@ export default function CSVViewer() {
       return baseDomain;
     }
 
+    const hostname = window.location.hostname;
+    const isLocalHost = isLocalHostname(hostname);
+
+    if (!isLocalHost) {
+      return baseDomain;
+    }
+
     const shouldUseProxy = typeof process !== 'undefined'
       && process.env?.REACT_APP_USE_S3_PROXY === 'true';
 
     if (!shouldUseProxy) {
-      return baseDomain;
+      return window.location.origin.replace(/\/$/, '');
     }
 
-    const hostname = window.location.hostname;
-    const isLocalHost = [
-      'localhost',
-      '127.0.0.1',
-      '::1',
-      '0.0.0.0'
-    ].includes(hostname);
-
-    return isLocalHost ? '/s3-proxy' : baseDomain;
+    return '/s3-proxy';
   }, [baseDomain]);
 
   const getListingBase = useCallback(() => {
@@ -693,14 +803,24 @@ export default function CSVViewer() {
 
   const buildListingUrl = useCallback((folder, params, baseOverride) => {
     const base = baseOverride ?? getListingBase();
-    if (base === '/s3-proxy') {
-      return `${base}/?${params}`;
+    const trimmedParams = params.toString();
+    if (!base) {
+      return `/?${trimmedParams}`;
     }
 
-    const baseUrl = `${base.replace(/\/$/, '')}/`;
-    const url = new URL(baseUrl);
-    url.search = params;
-    return url.toString();
+    if (base === '/s3-proxy') {
+      return `${base}/?${trimmedParams}`;
+    }
+
+    try {
+      const baseUrl = `${base.replace(/\/$/, '')}/`;
+      const url = new URL(baseUrl);
+      url.search = trimmedParams;
+      return url.toString();
+    } catch (error) {
+      const normalised = base.replace(/\/$/, '');
+      return `${normalised}/?${trimmedParams}`;
+    }
   }, [getListingBase]);
 
   const getElementsByTag = (context, tag) => {
@@ -1175,9 +1295,9 @@ export default function CSVViewer() {
           });
         }
       } catch (err) {
-        console.error('Failed to load terminology versions from S3', err);
+        console.error('Failed to load terminology versions', err);
         if (isMounted) {
-          setVersionLoadError('Unable to load versions from S3. Displaying latest available version.');
+          setVersionLoadError('Unable to load versions from the local catalog. Displaying latest available version.');
         }
       } finally {
         if (isMounted) {
