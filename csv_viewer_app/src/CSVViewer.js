@@ -111,6 +111,23 @@ const resolvePublicPath = () => {
   }
 };
 
+// Controls where the search worker fetches SQLite shards from while developing.
+// Values:
+//   - 'remote' – always use the remote manifest/shards (S3)
+//   - 'local'  – always use local manifest/shards (public/data/sqlite)
+//   - missing/other – default behaviour (prefer local on localhost)
+const getSqliteSourceMode = () => {
+  const mode = (process.env.REACT_APP_SQLITE_SOURCE || '').trim().toLowerCase();
+  if (mode === 'remote' || mode === 'local') {
+    return mode;
+  }
+  const forceRemote = (process.env.REACT_APP_SQLITE_FORCE_REMOTE || '').trim().toLowerCase();
+  if (forceRemote === 'true' || forceRemote === '1' || forceRemote === 'yes') {
+    return 'remote';
+  }
+  return 'auto';
+};
+
 const resolveBaseDomain = () => {
   const override = (process.env.REACT_APP_DATA_BASE_URL || '').trim();
   if (override) {
@@ -351,11 +368,12 @@ export default function CSVViewer() {
     workerInitVersionRef.current = initVersion;
 
     try {
-      // Prefer local shards on localhost by pointing the worker base URL to the
-      // local manifest path. We still pass the manifest payload directly, so no
-      // fetch is performed; only relative shard URLs depend on this base.
+      // Use env to control whether we use local or remote shards in dev.
+      // Default behaviour (auto): on localhost, prefer local shards; otherwise keep remote.
+      const sourceMode = getSqliteSourceMode();
       let effectiveManifestHref = manifestHref;
-      if (typeof window !== 'undefined' && isLocalHostname(window.location.hostname)) {
+      if (sourceMode !== 'remote' && typeof window !== 'undefined' && isLocalHostname(window.location.hostname)) {
+        // Prefer local shards on localhost unless explicitly forcing remote.
         const pathBase = `${resolvePublicPath() || ''}`.replace(/\/$/, '');
         const localHref = `${window.location.origin}${pathBase}/data/sqlite/${manifestPayload.datasetId}/manifest.json`;
         try {
@@ -412,8 +430,15 @@ export default function CSVViewer() {
     setSearchStatus('loading');
     setSearchError(null);
 
+    const isLikelyNpi = (() => {
+      const digitsOnly = trimmed.replace(/\D+/g, '');
+      return digitsOnly.length === 10;
+    })();
+
+    const dynamicLimit = isLikelyNpi ? 1 : SQLITE_SEARCH_RESULT_LIMIT;
+
     const { requestId, promise } = client.search(trimmed, {
-      limit: SQLITE_SEARCH_RESULT_LIMIT,
+      limit: dynamicLimit,
     });
     latestSearchRequestRef.current = requestId;
 
@@ -749,6 +774,17 @@ export default function CSVViewer() {
 
     const prefersLocalCatalog = typeof window !== 'undefined'
       && isLocalHostname(window.location.hostname);
+
+    // If explicitly forcing remote, prioritise the remote catalog first.
+    const sourceMode = getSqliteSourceMode();
+    if (sourceMode === 'remote') {
+      try {
+        const base = (typeof baseDomain === 'string' ? baseDomain : DEFAULT_BASE_DOMAIN).replace(/\/$/, '');
+        addCandidate(`${base}/terminology_viewer_sqlite/datasets.json`);
+      } catch (_) {
+        // fall through; the hard-coded fallback is still appended below
+      }
+    }
 
     addCandidate('data/sqlite/datasets.json');
     addCandidate('/data/sqlite/datasets.json');

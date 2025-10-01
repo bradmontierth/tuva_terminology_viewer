@@ -53,6 +53,26 @@ datasets render with friendly column names.
   into `public/sqljs/`; this runs automatically before `npm start`, `npm test`,
   and `npm run build`.
 
+### Dev environment variables
+
+- `REACT_APP_SQLITE_SOURCE` controls where the search worker fetches SQLite
+  shards while running `npm start`:
+  - `remote` – use the S3-hosted bundles referenced by the manifests
+  - `local` – use `public/data/sqlite/<datasetId>/manifest.json` and local shards
+  - unset/other – auto: prefer local when the app is served on a localhost host
+
+  Example (force remote on localhost):
+
+  `REACT_APP_USE_S3_PROXY=true REACT_APP_SQLITE_SOURCE=remote npm start`
+
+- `REACT_APP_USE_S3_PROXY` toggles the dev proxy used for S3 object listings on
+  localhost. Set to `true` to route `GET /s3-proxy/?list-type=2...` to the S3
+  bucket (recommended). If set to `false`, listings are attempted against the
+  dev server origin and will typically fail for remote buckets.
+
+- `REACT_APP_DATA_BASE_URL` can override the S3 base (e.g., a different bucket
+  or CDN origin). Default is `https://tuva-public-resources.s3.amazonaws.com`.
+
 ## Available Scripts
 
 In the project directory, you can run:

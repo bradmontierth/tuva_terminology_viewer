@@ -100,6 +100,33 @@ function buildFtsMatch(tokens) {
   return ftsTokens.join(' ');
 }
 
+function isLikelyNpiToken(token) {
+  // Treat a single 10-digit numeric token as an NPI candidate
+  return typeof token === 'string' && /^\d{10}$/.test(token);
+}
+
+function isExactNumericQuery(normalizedQuery) {
+  if (!normalizedQuery || !Array.isArray(normalizedQuery.tokens)) {
+    return false;
+  }
+  if (normalizedQuery.tokens.length !== 1) {
+    return false;
+  }
+  const [token] = normalizedQuery.tokens;
+  return isLikelyNpiToken(token);
+}
+
+function buildFtsMatchForQuery(normalizedQuery) {
+  if (!normalizedQuery || !Array.isArray(normalizedQuery.tokens) || !normalizedQuery.tokens.length) {
+    return null;
+  }
+  // For exact numeric IDs (e.g., 10-digit NPI), use exact match instead of prefix search
+  if (isExactNumericQuery(normalizedQuery)) {
+    return normalizedQuery.tokens[0];
+  }
+  return buildFtsMatch(normalizedQuery.tokens);
+}
+
 function buildLikeClause(columns, token) {
   const escaped = token.replace(/%/g, '\\%').replace(/_/g, '\\_');
   const likeExpression = `'%' || '${escaped}' || '%'`;
@@ -316,7 +343,7 @@ async function queryShard(shardIndex, normalizedQuery, limit) {
   let { db } = context;
   const manifest = state.manifest;
   const narrowColumns = manifest.narrowColumns || [];
-  const matchExpression = buildFtsMatch(normalizedQuery.tokens);
+  const matchExpression = buildFtsMatchForQuery(normalizedQuery);
   if (!matchExpression) {
     return { items: [], stats: null };
   }
@@ -340,7 +367,9 @@ async function queryShard(shardIndex, normalizedQuery, limit) {
     }
   }
 
-  if (!rows.length && normalizedQuery.tokens.length) {
+  // For exact numeric identifier queries (e.g., NPI), skip broad LIKE fallbacks
+  // to avoid heavy scans across very large shards.
+  if (!rows.length && normalizedQuery.tokens.length && !isExactNumericQuery(normalizedQuery)) {
     const likeClauses = normalizedQuery.tokens
       .filter((token) => token.length >= 2)
       .map((token) => buildLikeClause(narrowColumns, token));
@@ -431,6 +460,12 @@ async function handleSearchMessage(payload) {
     return;
   }
 
+  // For exact numeric IDs (e.g., a 10-digit NPI), cap limit to 1
+  // so we stop scanning shards immediately after the first hit.
+  const effectiveLimit = isExactNumericQuery(normalized)
+    ? Math.min(1, Number.isFinite(limit) ? Number(limit) : MAX_RESULTS)
+    : (Number.isFinite(limit) ? Number(limit) : MAX_RESULTS);
+
   const shardCandidates = await selectCandidateShards(normalized.ngrams);
   postMessage({ type: 'log', level: 'log', message: `search request ${requestId} shard candidates: ${JSON.stringify(shardCandidates)}` });
   const collected = [];
@@ -439,7 +474,7 @@ async function handleSearchMessage(payload) {
   const seenRowIds = new Set();
 
   for (const shardIndex of shardCandidates) {
-    const { items, stats } = await queryShard(shardIndex, normalized, limit);
+    const { items, stats } = await queryShard(shardIndex, normalized, effectiveLimit);
     shardStats.push(stats);
     for (const item of items) {
       if (seenRowIds.has(item.rowid)) {
@@ -450,11 +485,11 @@ async function handleSearchMessage(payload) {
       if (firstBatch.length < FIRST_BATCH_SIZE) {
         firstBatch.push(item);
       }
-      if (collected.length >= limit) {
+      if (collected.length >= effectiveLimit) {
         break;
       }
     }
-    if (collected.length >= limit) {
+    if (collected.length >= effectiveLimit) {
       break;
     }
   }
