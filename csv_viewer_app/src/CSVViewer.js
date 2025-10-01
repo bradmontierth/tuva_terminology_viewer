@@ -32,7 +32,8 @@ const arraysEqual = (a = [], b = []) => {
 
 const CSV_TEXT_LIMIT = 5000000; // 5MB of text before limiting rows
 const SQLITE_SEARCH_RESULT_LIMIT = 50;
-const SQLITE_BYTES_BUDGET = 32 * 1024 * 1024; // 32MB default cache budget
+// Increase default cache budget to reduce eviction churn on large shards
+const SQLITE_BYTES_BUDGET = 128 * 1024 * 1024; // 128MB
 const DEFAULT_BASE_DOMAIN = 'https://tuva-public-resources.s3.amazonaws.com';
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0']);
 
@@ -148,12 +149,20 @@ const formatHeader = (value) => {
     .join(' ');
 };
 
-const useDebouncedValue = (value, delay) => {
+const useDebouncedValue = (value, delay, resetKey = null, resetTo = undefined) => {
   const [debounced, setDebounced] = useState(value);
   useEffect(() => {
     const timer = setTimeout(() => setDebounced(value), delay);
     return () => clearTimeout(timer);
   }, [value, delay]);
+  // If resetKey changes (e.g., dataset switch), flush immediately to current value.
+  useEffect(() => {
+    if (resetTo !== undefined) {
+      setDebounced(resetTo);
+    } else {
+      setDebounced(value);
+    }
+  }, [resetKey]);
   return debounced;
 };
 
@@ -291,7 +300,6 @@ export default function CSVViewer() {
   const [versionLoadError, setVersionLoadError] = useState(null);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [fileLoadError, setFileLoadError] = useState(null);
-  const debouncedFilterTerm = useDebouncedValue(filterTerm, 250);
   const [searchMode, setSearchMode] = useState('inMemory');
   const [searchStatus, setSearchStatus] = useState('idle');
   const [searchError, setSearchError] = useState(null);
@@ -309,6 +317,7 @@ export default function CSVViewer() {
   const workerInitVersionRef = useRef(0);
   const latestSearchRequestRef = useRef(null);
   const sqliteCatalogRef = useRef(new Map());
+  const suppressNextAutoSearchRef = useRef(false);
 
   const activeCategory = useMemo(
     () => dataCategories.find((category) => category.id === activeCategoryId) || dataCategories[0],
@@ -321,6 +330,7 @@ export default function CSVViewer() {
   const hasVersionedSources = versionedSources.length > 0;
 
   const currentDatasetId = useMemo(() => deriveDatasetId(currentFileName), [currentFileName]);
+  const debouncedFilterTerm = useDebouncedValue(filterTerm, 250, currentDatasetId, '');
   const sqliteEntry = useMemo(() => {
     if (!currentDatasetId) {
       return null;
@@ -341,9 +351,23 @@ export default function CSVViewer() {
     workerInitVersionRef.current = initVersion;
 
     try {
+      // Prefer local shards on localhost by pointing the worker base URL to the
+      // local manifest path. We still pass the manifest payload directly, so no
+      // fetch is performed; only relative shard URLs depend on this base.
+      let effectiveManifestHref = manifestHref;
+      if (typeof window !== 'undefined' && isLocalHostname(window.location.hostname)) {
+        const pathBase = `${resolvePublicPath() || ''}`.replace(/\/$/, '');
+        const localHref = `${window.location.origin}${pathBase}/data/sqlite/${manifestPayload.datasetId}/manifest.json`;
+        try {
+          // Ensure we build a valid absolute URL
+          effectiveManifestHref = new URL(localHref, window.location.origin).toString();
+        } catch (_) {
+          effectiveManifestHref = localHref;
+        }
+      }
       await workerClientRef.current.init({
         datasetId: manifestPayload.datasetId,
-        manifestUrl: manifestHref,
+        manifestUrl: effectiveManifestHref,
         manifest: manifestPayload,
         bytesBudget: SQLITE_BYTES_BUDGET,
       });
@@ -363,6 +387,11 @@ export default function CSVViewer() {
     }
 
     const trimmed = query.trim();
+    // If the debounced query does not match the current input, skip.
+    // This avoids firing a search with a stale value just after dataset switches.
+    if (trimmed && trimmed !== filterTerm.trim()) {
+      return;
+    }
     if (!trimmed) {
       latestSearchRequestRef.current = null;
       setSearchStatus('idle');
@@ -428,7 +457,7 @@ export default function CSVViewer() {
         setSearchSummary(null);
         setCsvData([]);
       });
-  }, [manifest, searchMode, sqlitePreview, setCurrentPage]);
+  }, [manifest, searchMode, sqlitePreview, setCurrentPage, filterTerm]);
 
   useEffect(() => {
     setFileGroups([]);
@@ -461,6 +490,9 @@ export default function CSVViewer() {
   useEffect(() => {
     latestSearchRequestRef.current = null;
     if (sqliteEntry) {
+      // Switching to a SQLite-backed dataset: ensure we don't auto-search using
+      // the previous dataset's query.
+      suppressNextAutoSearchRef.current = true;
       setSearchMode('sqlite');
       setSearchStatus('idle');
       setSearchError(null);
@@ -487,6 +519,19 @@ export default function CSVViewer() {
     let isMounted = true;
 
     const loadSqliteDataset = async () => {
+      // Kill any in-flight searches from the previous dataset by
+      // fully terminating the worker before we proceed.
+      try {
+        if (workerClientRef.current) {
+          workerClientRef.current.terminate();
+        }
+      } catch (e) {
+        // ignore termination errors
+      } finally {
+        workerClientRef.current = null;
+        latestSearchRequestRef.current = null;
+      }
+
       setLoading(true);
       setPreviewLoading(true);
       setPreviewError(null);
@@ -498,6 +543,9 @@ export default function CSVViewer() {
       setDefaultHeaders([]);
       setColumnCount(0);
       setFilterTerm('');
+      // Prevent the manifest-triggered search effect from reusing the
+      // previous dataset's debounced query value.
+      suppressNextAutoSearchRef.current = true;
       setCurrentPage(1);
 
       try {
@@ -588,6 +636,13 @@ export default function CSVViewer() {
     if (searchMode !== 'sqlite' || !manifest) {
       return;
     }
+    // When switching datasets we clear the input but the debounced value
+    // may still hold the previous query for a moment. Suppress the first
+    // auto-search after a dataset change to avoid firing a stale query.
+    if (suppressNextAutoSearchRef.current) {
+      suppressNextAutoSearchRef.current = false;
+      return;
+    }
     executeSqliteSearch(debouncedFilterTerm);
   }, [searchMode, manifest, debouncedFilterTerm, executeSqliteSearch]);
 
@@ -657,7 +712,7 @@ export default function CSVViewer() {
       } catch (err) {
         console.error('Failed to load header crosswalk map', err);
         if (isMounted) {
-          setHeaderCrosswalk((previous) => (previous && typeof previous === 'object' ? previous : null));
+          setHeaderCrosswalk((previous) => (previous && typeof previous === 'object' ? previous : (headerCrosswalkFallback || null)));
         }
       }
     };
@@ -709,9 +764,8 @@ export default function CSVViewer() {
     if (origin) {
       addCandidate(`${origin}/data/sqlite/datasets.json`);
     }
-    if (!prefersLocalCatalog) {
-      addCandidate('https://tuva-public-resources.s3.amazonaws.com/terminology_viewer_sqlite/datasets.json');
-    }
+    // Always include a remote fallback at the end to recover when local paths serve HTML.
+    addCandidate('https://tuva-public-resources.s3.amazonaws.com/terminology_viewer_sqlite/datasets.json');
 
     const loadCatalog = async () => {
       let lastError = null;
@@ -780,13 +834,11 @@ export default function CSVViewer() {
       return baseDomain;
     }
 
-    const shouldUseProxy = typeof process !== 'undefined'
-      && process.env?.REACT_APP_USE_S3_PROXY === 'true';
-
-    if (!shouldUseProxy) {
+    // Default to using the dev proxy on localhost to avoid HTML index responses.
+    const useProxyEnv = typeof process !== 'undefined' ? process.env?.REACT_APP_USE_S3_PROXY : undefined;
+    if (useProxyEnv === 'false') {
       return window.location.origin.replace(/\/$/, '');
     }
-
     return '/s3-proxy';
   }, [baseDomain]);
 
@@ -1099,15 +1151,22 @@ export default function CSVViewer() {
     }
     const targetFolder = folder || default_folder;
     const isVersionedFolder = versionedFolders.has(targetFolder);
+    // Prefer the same base used for listings; on localhost this is /s3-proxy.
+    let base = getListingBase();
+    if (!base) {
+      base = baseDomain;
+    }
+    const normalisedBase = base.replace(/\/$/, '');
+
     if (isVersionedFolder) {
       if (!version) {
         return '';
       }
-      return `${baseDomain}/${targetFolder}/${version}/${fileName}`;
+      return `${normalisedBase}/${targetFolder}/${version}/${fileName}`;
     }
 
-    return `${baseDomain}/${targetFolder}/${fileName}`;
-  }, [baseDomain, currentFileFolder, currentFileName, default_folder, terminologyVersion, versionedFolders]);
+    return `${normalisedBase}/${targetFolder}/${fileName}`;
+  }, [baseDomain, currentFileFolder, currentFileName, default_folder, terminologyVersion, versionedFolders, getListingBase]);
 
   useEffect(() => {
     let isMounted = true;
@@ -1686,6 +1745,8 @@ export default function CSVViewer() {
       return;
     }
 
+    // Prevent stale auto-search on dataset switch
+    suppressNextAutoSearchRef.current = true;
     setSelectedGroupId(groupId);
     const nextFile = group.files[0] || null;
     setCurrentFileName(nextFile);
@@ -1702,6 +1763,8 @@ export default function CSVViewer() {
       return;
     }
 
+    // Prevent stale auto-search on dataset switch
+    suppressNextAutoSearchRef.current = true;
     setSelectedGroupId(groupId);
     setCurrentFileName(fileName);
     setCurrentFileFolder(group.folder);
@@ -1712,6 +1775,8 @@ export default function CSVViewer() {
       return;
     }
     userSelectedVersionRef.current = true;
+    // Prevent stale auto-search when version changes underneath
+    suppressNextAutoSearchRef.current = true;
     setTerminologyVersion(version);
     // The useEffect will automatically trigger and reload the current file with the new version
   };

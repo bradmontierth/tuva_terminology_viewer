@@ -208,6 +208,12 @@ async function openShard(shardIndex) {
   const resource = state.manifest.resources[shardIndex];
   const virtualFilename = resource.file;
   const pageSize = state.manifest.pageSizeBytes || DEFAULT_PAGE_SIZE;
+  // Use a larger HTTP chunk size than the SQLite page size to avoid
+  // excessive tiny range requests on large files. Bump further for
+  // multi‑GB shards.
+  const httpChunkSize = resource.size && resource.size > (1 << 30)
+    ? Math.max(512 * 1024, pageSize)
+    : Math.max(128 * 1024, pageSize);
   const fileUrl = resolveUrl(resource.url, state.baseUrl);
   const cacheBust = resource.sha256 || resource.file;
 
@@ -230,7 +236,15 @@ async function openShard(shardIndex) {
     config: {
       serverMode: 'full',
       url: fileUrl,
-      requestChunkSize: pageSize,
+      // Reduce request churn by fetching larger chunks per request.
+      requestChunkSize: httpChunkSize,
+      // Provide known file length to skip HEAD checks and prevent
+      // out-of-bounds range queries near EOF.
+      fileLength: Number(resource.size) || undefined,
+      // Limit concurrent range reads for stability with large shards.
+      maxReadHeads: 1,
+      // Keep request bursts small.
+      maxReadSpeed: 2 * 1024 * 1024, // 2 MiB/s
       cacheBust,
     },
   };
@@ -261,6 +275,22 @@ async function openShard(shardIndex) {
   return promise;
 }
 
+async function reopenShard(shardIndex) {
+  const existing = state.shards.get(shardIndex);
+  if (existing && existing.promise) {
+    try {
+      const resolved = await existing.promise.catch(() => null);
+      if (resolved && resolved.db && typeof resolved.db.close === 'function') {
+        try { resolved.db.close(); } catch (_) { /* ignore */ }
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
+  state.shards.delete(shardIndex);
+  return openShard(shardIndex);
+}
+
 async function collectShardStats(shardContext) {
   if (!shardContext?.worker?.getStats) {
     return null;
@@ -282,8 +312,8 @@ function formatRow(row, narrowColumns) {
 }
 
 async function queryShard(shardIndex, normalizedQuery, limit) {
-  const context = await openShard(shardIndex);
-  const { db } = context;
+  let context = await openShard(shardIndex);
+  let { db } = context;
   const manifest = state.manifest;
   const narrowColumns = manifest.narrowColumns || [];
   const matchExpression = buildFtsMatch(normalizedQuery.tokens);
@@ -292,8 +322,23 @@ async function queryShard(shardIndex, normalizedQuery, limit) {
   }
 
   const startStats = await collectShardStats(context);
-  const ftsSql = `SELECT rowid FROM t_fts WHERE t_fts MATCH '${matchExpression}' ORDER BY bm25(t_fts) LIMIT ${limit};`;
-  let rows = rowsFromExec(await db.exec(ftsSql));
+  // Avoid ORDER BY bm25 to reduce random reads on very large shards.
+  const ftsSql = `SELECT rowid FROM t_fts WHERE t_fts MATCH '${matchExpression}' LIMIT ${limit};`;
+  let rows;
+  try {
+    rows = rowsFromExec(await db.exec(ftsSql));
+  } catch (err) {
+    // Retry once on transient IO errors by reopening the shard.
+    const message = String(err && err.message ? err.message : err || '');
+    if (/io\s*error|ioerr/i.test(message)) {
+      postMessage({ type: 'log', level: 'warn', message: `IO error on shard ${shardIndex}; retrying once` });
+      context = await reopenShard(shardIndex);
+      db = context.db;
+      rows = rowsFromExec(await db.exec(ftsSql));
+    } else {
+      throw err;
+    }
+  }
 
   if (!rows.length && normalizedQuery.tokens.length) {
     const likeClauses = normalizedQuery.tokens
@@ -301,7 +346,19 @@ async function queryShard(shardIndex, normalizedQuery, limit) {
       .map((token) => buildLikeClause(narrowColumns, token));
     if (likeClauses.length) {
       const fallbackSql = `SELECT rowid FROM t_fts WHERE ${likeClauses.join(' AND ')} LIMIT ${limit};`;
-      rows = rowsFromExec(await db.exec(fallbackSql));
+      try {
+        rows = rowsFromExec(await db.exec(fallbackSql));
+      } catch (err) {
+        const message = String(err && err.message ? err.message : err || '');
+        if (/io\s*error|ioerr/i.test(message)) {
+          postMessage({ type: 'log', level: 'warn', message: `IO error on shard ${shardIndex} during LIKE; retrying once` });
+          context = await reopenShard(shardIndex);
+          db = context.db;
+          rows = rowsFromExec(await db.exec(fallbackSql));
+        } else {
+          throw err;
+        }
+      }
     }
   }
 
@@ -345,9 +402,14 @@ function accumulateBytes(stats) {
 }
 
 async function handleSearchMessage(payload) {
-  const { requestId, query, limit = MAX_RESULTS } = payload;
+  const { requestId, query, limit = MAX_RESULTS, datasetId: requestDatasetId } = payload;
   if (!state.manifest) {
     postMessage({ type: 'error', error: 'Search worker is not initialised.', requestId });
+    return;
+  }
+  if (requestDatasetId && requestDatasetId !== state.datasetId) {
+    // Drop stale requests that were queued before a dataset switch.
+    postMessage({ type: 'log', level: 'log', message: `dropping stale search request ${requestId} for dataset ${requestDatasetId}` });
     return;
   }
   postMessage({ type: 'log', level: 'log', message: `search request ${requestId}: ${query}` });

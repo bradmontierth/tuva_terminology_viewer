@@ -72,6 +72,7 @@ export default class SearchWorkerClient {
     this.pendingRequests = new Map();
     this.listeners = new Set();
     this.assetBaseUrl = options.assetBaseUrl || DEFAULT_ASSET_BASE;
+    this.datasetId = null;
     this.readyPromise = Promise.resolve();
     this.resolveReady = null;
     this.rejectReady = null;
@@ -176,6 +177,7 @@ export default class SearchWorkerClient {
       this.resolveReady = resolve;
       this.rejectReady = reject;
     });
+    this.datasetId = datasetId || null;
     return new Promise((resolve, reject) => {
       this.pendingInit = { resolve, reject };
       this.worker.postMessage({
@@ -204,6 +206,7 @@ export default class SearchWorkerClient {
           requestId,
           query,
           limit,
+          datasetId: this.datasetId,
         });
       })
       .catch((error) => {
