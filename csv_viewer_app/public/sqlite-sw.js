@@ -5,7 +5,14 @@ const shouldHandleRequest = (request) => {
     return false;
   }
   const { pathname } = new URL(request.url);
-  return pathname.endsWith('.sqlite') || pathname.endsWith('.wasm');
+  const isSqlite = pathname.endsWith('.sqlite');
+  const isWasm = pathname.endsWith('.wasm');
+  // Avoid intercepting Range requests for SQLite files; letting the browser
+  // talk directly to the CDN can significantly reduce latency for small chunks.
+  if (isSqlite && request.headers.get('range')) {
+    return false;
+  }
+  return isSqlite || isWasm;
 };
 
 const cacheKeyForRequest = (request) => {

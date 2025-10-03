@@ -235,12 +235,16 @@ async function openShard(shardIndex) {
   const resource = state.manifest.resources[shardIndex];
   const virtualFilename = resource.file;
   const pageSize = state.manifest.pageSizeBytes || DEFAULT_PAGE_SIZE;
-  // Use a larger HTTP chunk size than the SQLite page size to avoid
-  // excessive tiny range requests on large files. Bump further for
-  // multi‑GB shards.
-  const httpChunkSize = resource.size && resource.size > (1 << 30)
-    ? Math.max(512 * 1024, pageSize)
-    : Math.max(128 * 1024, pageSize);
+  // Tune HTTP request behavior by shard size.
+  // - Larger chunk sizes reduce request overhead on huge files.
+  // - Allow modest parallelism to better utilize HTTP/2 multiplexing.
+  // - Raise the read speed cap to avoid artificial throttling.
+  const isHugeShard = resource.size && resource.size > (1 << 30); // > 1 GiB
+  const httpChunkSize = isHugeShard
+    ? Math.max(2 * 1024 * 1024, pageSize)   // 2 MiB chunks for very large shards
+    : Math.max(256 * 1024, pageSize);       // 256 KiB for smaller shards
+  const maxReadHeads = isHugeShard ? 3 : 4; // modest parallelism on smaller shards
+  const maxReadSpeed = isHugeShard ? (32 * 1024 * 1024) : (16 * 1024 * 1024); // 32/16 MiB/s caps
   const fileUrl = resolveUrl(resource.url, state.baseUrl);
   const cacheBust = resource.sha256 || resource.file;
 
@@ -268,10 +272,10 @@ async function openShard(shardIndex) {
       // Provide known file length to skip HEAD checks and prevent
       // out-of-bounds range queries near EOF.
       fileLength: Number(resource.size) || undefined,
-      // Limit concurrent range reads for stability with large shards.
-      maxReadHeads: 1,
-      // Keep request bursts small.
-      maxReadSpeed: 2 * 1024 * 1024, // 2 MiB/s
+      // Allow limited concurrent range reads for better throughput.
+      maxReadHeads,
+      // Relax throttling to avoid per-request stalls on big objects.
+      maxReadSpeed,
       cacheBust,
     },
   };

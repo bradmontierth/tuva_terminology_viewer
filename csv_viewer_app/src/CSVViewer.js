@@ -5,6 +5,7 @@ import pako from 'pako';
 import JSZip from 'jszip';
 import SearchWorkerClient from './lib/SearchWorkerClient';
 import headerCrosswalkFallback from './generated/headerCrosswalk.json';
+import fileIdentityCrosswalkFallback from './generated/fileIdentityCrosswalk.json';
 
 const normalizeKey = (value = '') => value.trim().toLowerCase();
 
@@ -299,6 +300,12 @@ export default function CSVViewer() {
     }
     return null;
   });
+  const [identityCrosswalk, setIdentityCrosswalk] = useState(() => {
+    if (fileIdentityCrosswalkFallback && typeof fileIdentityCrosswalkFallback === 'object') {
+      return fileIdentityCrosswalkFallback;
+    }
+    return null;
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [currentFileName, setCurrentFileName] = useState(null);
@@ -323,11 +330,36 @@ export default function CSVViewer() {
   const [searchSummary, setSearchSummary] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState(null);
+  const [isCrosswalkOpen, setIsCrosswalkOpen] = useState(false);
   const [manifest, setManifest] = useState(null);
   const [manifestUrl, setManifestUrl] = useState(null);
   const [sqliteCatalogError, setSqliteCatalogError] = useState(null);
   const [sqliteCatalogVersion, setSqliteCatalogVersion] = useState(0);
+  const [sqliteCatalogReady, setSqliteCatalogReady] = useState(false);
   const [sqlitePreview, setSqlitePreview] = useState({ columns: [], rows: [], generatedAt: null });
+  // Control whether to fetch crosswalk JSONs from network; default prod-only
+  const shouldFetchCrosswalks = useMemo(() => {
+    const raw = (process.env.REACT_APP_FETCH_CROSSWALKS || '').trim().toLowerCase();
+    if (raw === '1' || raw === 'true' || raw === 'yes') return true;
+    if (raw === '0' || raw === 'false' || raw === 'no') return false;
+    return process.env.NODE_ENV === 'production';
+  }, []);
+  const offlineMode = useMemo(() => {
+    const raw = (process.env.REACT_APP_OFFLINE_MODE || '').trim().toLowerCase();
+    return raw === '1' || raw === 'true' || raw === 'yes';
+  }, []);
+  const identityLiveEnabled = useMemo(() => {
+    const raw = (process.env.REACT_APP_IDENTITY_LIVE || '').trim().toLowerCase();
+    if (offlineMode) return false;
+    if (raw === '0' || raw === 'false' || raw === 'no') return false;
+    if (raw === '1' || raw === 'true' || raw === 'yes') return true;
+    // Default: if we are fetching crosswalks, prefer not to do live identity checks
+    return !shouldFetchCrosswalks;
+  }, [offlineMode, shouldFetchCrosswalks]);
+  // Cache for S3 object ETags and sizes keyed by full key path
+  const etagCacheRef = useRef(new Map());
+  // Tracks sameness across versions for the selected file
+  const [fileIdentity, setFileIdentity] = useState({ status: 'idle', sameSince: null, changedAt: null, newerChangedAt: null, error: null, compared: [] });
   const userSelectedVersionRef = useRef(false);
   const listingBaseRef = useRef(null);
   const workerClientRef = useRef(null);
@@ -354,6 +386,71 @@ export default function CSVViewer() {
     }
     return sqliteCatalogRef.current.get(currentDatasetId) || null;
   }, [currentDatasetId, sqliteCatalogVersion]);
+
+  // Identify the most recent concrete version (excluding symbolic 'latest') for the active folder
+  const latestConcreteVersion = useMemo(() => {
+    const isLatest = (v) => String(v || '').trim().toLowerCase() === 'latest';
+    if (!currentFileFolder || !identityCrosswalk) {
+      return null;
+    }
+    const folderEntry = identityCrosswalk[currentFileFolder];
+    const fromFolder = (folderEntry && Array.isArray(folderEntry.versions))
+      ? folderEntry.versions
+      : (identityCrosswalk?._meta?.versionsPerFolder?.[currentFileFolder] || []);
+    const versions = Array.isArray(fromFolder) ? fromFolder : [];
+    const firstConcrete = versions.find((v) => !isLatest(v));
+    return firstConcrete || null;
+  }, [currentFileFolder, identityCrosswalk]);
+
+  // Determine if the SQLite index (built on latest content) matches the selected version's content
+  const sqliteIndexCompatible = useMemo(() => {
+    const isLatest = (v) => String(v || '').trim().toLowerCase() === 'latest';
+    const normalizeBaseCsv = (name = '') => {
+      const normalized = String(name || '').trim();
+      if (!normalized) return '';
+      const m = normalized.match(/^(.*?\.csv)(?:_[0-9]+(?:_[0-9]+)*)?\.csv\.gz$/i);
+      if (m) return m[1].toLowerCase();
+      if (/\.csv\.gz$/i.test(normalized)) return normalized.replace(/\.csv\.gz$/i, '.csv').toLowerCase();
+      return normalized.toLowerCase();
+    };
+    if (!sqliteEntry) {
+      return false;
+    }
+    if (!versionedFolders.has(currentFileFolder)) {
+      return true;
+    }
+    if (!terminologyVersion) {
+      return true;
+    }
+    if (isLatest(terminologyVersion)) {
+      return true;
+    }
+    const folderEntry = identityCrosswalk && identityCrosswalk[currentFileFolder];
+    const baseName = normalizeBaseCsv(currentFileName);
+    const group = folderEntry && folderEntry.groups && folderEntry.groups[baseName];
+    if (!group) {
+      // No identity info – be permissive to avoid blocking
+      return true;
+    }
+    const latestV = latestConcreteVersion;
+    if (!latestV) {
+      return true;
+    }
+    const history = Array.isArray(group.history) ? group.history : [];
+    const selectedEntry = history.find((h) => h && h.version === terminologyVersion);
+    const latestEntry = history.find((h) => h && h.version === latestV);
+    if (selectedEntry?.signature && latestEntry?.signature) {
+      return selectedEntry.signature === latestEntry.signature;
+    }
+    const runs = Array.isArray(group.runs) ? group.runs : [];
+    if (runs.length) {
+      const run = runs.find((r) => Array.isArray(r.versions) && r.versions.includes(terminologyVersion));
+      if (run && Array.isArray(run.versions)) {
+        return run.versions.includes(latestV);
+      }
+    }
+    return true;
+  }, [sqliteEntry, versionedFolders, currentFileFolder, terminologyVersion, identityCrosswalk, currentFileName, latestConcreteVersion]);
 
   const initializeWorker = useCallback(async (manifestPayload, manifestHref) => {
     if (!manifestPayload || !manifestHref) {
@@ -398,6 +495,89 @@ export default function CSVViewer() {
       }
     }
   }, []);
+
+  // Load precomputed file identity crosswalk if available
+  useEffect(() => {
+    let isMounted = true;
+
+    const fetchIdentity = async () => {
+      const uniquePaths = new Set();
+      const addPath = (base, suffix) => {
+        if (!suffix) {
+          return;
+        }
+        const normalizedBase = base ? base.replace(/\/$/, '') : '';
+        const normalizedSuffix = suffix.startsWith('/') ? suffix : `/${suffix}`;
+        const candidate = `${normalizedBase}${normalizedSuffix}` || normalizedSuffix;
+        if (candidate) {
+          uniquePaths.add(candidate);
+        }
+      };
+
+      try {
+        const publicPath = resolvePublicPath();
+        const origin = typeof window !== 'undefined' ? window.location.origin : '';
+
+        // Always prefer local candidates (no remote domains here)
+        addPath(publicPath, '/data/file-identity-crosswalk.json');
+        addPath(publicPath, 'data/file-identity-crosswalk.json');
+        addPath('', '/data/file-identity-crosswalk.json');
+        addPath('', 'data/file-identity-crosswalk.json');
+        if (origin) {
+          addPath(origin, `${publicPath || ''}/data/file-identity-crosswalk.json`);
+          addPath(origin, '/data/file-identity-crosswalk.json');
+        }
+
+        let parsed = null;
+        let lastError = null;
+        for (const requestPath of uniquePaths) {
+          try {
+            const response = await fetch(requestPath, { cache: 'no-store' });
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status} ${response.statusText}`);
+            }
+
+            const contentType = response.headers.get('content-type') || '';
+            if (!contentType.includes('json')) {
+              const text = await response.clone().text();
+              if (/^\s*</.test(text)) {
+                throw new Error('Received non-JSON response (likely HTML).');
+              }
+              parsed = JSON.parse(text);
+            } else {
+              parsed = await response.json();
+            }
+
+            break;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+
+        if (!parsed) {
+          throw lastError || new Error('Unable to load identity crosswalk map.');
+        }
+
+        if (isMounted) {
+          setIdentityCrosswalk(parsed);
+        }
+      } catch (err) {
+        console.warn('Failed to load identity crosswalk map', err);
+        if (isMounted) {
+          setIdentityCrosswalk((previous) => (previous && typeof previous === 'object' ? previous : (fileIdentityCrosswalkFallback || null)));
+        }
+      }
+    };
+
+    // Only perform fetch if (a) production or (b) offline mode requests local JSON
+    if (shouldFetchCrosswalks || offlineMode) {
+      fetchIdentity();
+    }
+
+    return () => {
+      isMounted = false;
+    };
+  }, [shouldFetchCrosswalks, offlineMode]);
 
   const executeSqliteSearch = useCallback((query) => {
     if (searchMode !== 'sqlite' || !manifest || !workerClientRef.current) {
@@ -512,9 +692,17 @@ export default function CSVViewer() {
     }
   }, []);
 
+  // Ensure worker is terminated when leaving SQLite mode
+  useEffect(() => {
+    if (searchMode !== 'sqlite' && workerClientRef.current) {
+      try { workerClientRef.current.terminate(); } catch (_) { /* noop */ }
+      workerClientRef.current = null;
+    }
+  }, [searchMode]);
+
   useEffect(() => {
     latestSearchRequestRef.current = null;
-    if (sqliteEntry) {
+    if (sqliteEntry && sqliteIndexCompatible) {
       // Switching to a SQLite-backed dataset: ensure we don't auto-search using
       // the previous dataset's query.
       suppressNextAutoSearchRef.current = true;
@@ -534,7 +722,166 @@ export default function CSVViewer() {
     setSearchStatus('idle');
     setSearchError(null);
     setSearchSummary(null);
-  }, [sqliteEntry]);
+  }, [sqliteEntry, sqliteIndexCompatible]);
+
+  // Compute sameness across older versions for the currently selected file.
+  useEffect(() => {
+    let alive = true;
+    const run = async () => {
+      setFileIdentity({ status: 'loading', sameSince: null, changedAt: null, newerChangedAt: null, error: null, compared: [] });
+      try {
+        if (!currentFileName || !currentFileFolder) {
+          if (alive) setFileIdentity({ status: 'idle', sameSince: null, changedAt: null, newerChangedAt: null, error: null, compared: [] });
+          return;
+        }
+        if (!versionedFolders.has(currentFileFolder)) {
+          if (alive) setFileIdentity({ status: 'idle', sameSince: null, changedAt: null, newerChangedAt: null, error: null, compared: [] });
+          return;
+        }
+        const currentVersion = terminologyVersion;
+        if (!currentVersion) {
+          if (alive) setFileIdentity({ status: 'idle', sameSince: null, changedAt: null, newerChangedAt: null, error: null, compared: [] });
+          return;
+        }
+
+        // Prefer precomputed identity crosswalk when available
+        try {
+          const folderEntry = identityCrosswalk && identityCrosswalk[currentFileFolder];
+          const groups = folderEntry && folderEntry.groups;
+          const baseName = toBaseCsvName(currentFileName).toLowerCase();
+          const group = groups && groups[baseName];
+          if (group && Array.isArray(group.runs)) {
+            // Resolve 'latest' against crosswalk history so we can avoid live checks
+            let targetVersion = currentVersion;
+            if (isLatestVersion(currentVersion)) {
+              const fromGroup = group.history?.[0]?.version || null;
+              if (fromGroup) targetVersion = fromGroup;
+              else if (Array.isArray(folderEntry?.versions)) {
+                const firstConcrete = folderEntry.versions.find((v) => !isLatestVersion(v));
+                if (firstConcrete) targetVersion = firstConcrete;
+              } else if (identityCrosswalk?._meta?.versionsPerFolder?.[currentFileFolder]) {
+                const candidates = identityCrosswalk._meta.versionsPerFolder[currentFileFolder];
+                const firstConcrete = candidates.find((v) => !isLatestVersion(v));
+                if (firstConcrete) targetVersion = firstConcrete;
+              }
+            }
+            const runInfo = group.runs.find((r) => Array.isArray(r.versions) && r.versions.includes(targetVersion));
+            if (runInfo) {
+              const sameSince = runInfo.versions[runInfo.versions.length - 1] || currentVersion;
+              // Compute nearest newer version where content changes (if any)
+              let newerChangedAt = null;
+              let changedAt = null;
+              const orderedVersions = Array.isArray(folderEntry?.versions)
+                ? folderEntry.versions.filter((v) => !isLatestVersion(v))
+                : (identityCrosswalk?._meta?.versionsPerFolder?.[currentFileFolder] || []).filter((v) => !isLatestVersion(v));
+              if (orderedVersions.length) {
+                const start = runInfo.versions[0];
+                const end = runInfo.versions[runInfo.versions.length - 1];
+                const startIdx = orderedVersions.indexOf(start);
+                const endIdx = orderedVersions.indexOf(end);
+                if (startIdx > 0) {
+                  newerChangedAt = orderedVersions[startIdx - 1] || null;
+                }
+                if (endIdx !== -1 && endIdx + 1 < orderedVersions.length) {
+                  changedAt = orderedVersions[endIdx + 1] || null;
+                }
+              }
+              if (alive) {
+                setFileIdentity({ status: 'ready', sameSince, changedAt, newerChangedAt, error: null, compared: runInfo.versions });
+              }
+              return;
+            }
+            // Fallback for legacy crosswalks: derive contiguous versions from history
+            const history = Array.isArray(group.history) ? group.history : [];
+            const thisVersion = history.find((h) => h && h.version === targetVersion);
+            if (thisVersion && thisVersion.signature) {
+              const sig = thisVersion.signature;
+              const members = history.filter((h) => h && h.signature === sig).map((h) => h.version);
+              members.sort((a, b) => compareVersionStrings(b, a));
+              const sameSince = members[members.length - 1] || currentVersion;
+              // Compute newer/older change boundaries from folder version ordering
+              let newerChangedAt = null;
+              let changedAt = null;
+              const orderedVersions = Array.isArray(folderEntry?.versions)
+                ? folderEntry.versions.filter((v) => !isLatestVersion(v))
+                : (identityCrosswalk?._meta?.versionsPerFolder?.[currentFileFolder] || []).filter((v) => !isLatestVersion(v));
+              if (orderedVersions.length) {
+                const start = members[0];
+                const end = members[members.length - 1];
+                const startIdx = orderedVersions.indexOf(start);
+                const endIdx = orderedVersions.indexOf(end);
+                if (startIdx > 0) {
+                  newerChangedAt = orderedVersions[startIdx - 1] || null;
+                }
+                if (endIdx !== -1 && endIdx + 1 < orderedVersions.length) {
+                  changedAt = orderedVersions[endIdx + 1] || null;
+                }
+              }
+              if (alive) {
+                setFileIdentity({ status: 'ready', sameSince, changedAt, newerChangedAt, error: null, compared: members });
+              }
+              return;
+            }
+          }
+        } catch (_) {
+          // fall back to live check
+        }
+
+        if (offlineMode || !identityLiveEnabled) {
+          // In offline mode, skip live S3 comparisons
+          if (alive) setFileIdentity({ status: 'ready', sameSince: null, changedAt: null, newerChangedAt: null, error: null, compared: [] });
+          return;
+        }
+
+        // Fallback to live ETag comparisons against older versions
+        const currentMeta = await fetchEtagForFile(currentFileFolder, currentVersion, currentFileName);
+        if (!currentMeta || !currentMeta.etag) {
+          if (alive) setFileIdentity({ status: 'error', sameSince: null, changedAt: null, error: 'No metadata for current file', compared: [] });
+          return;
+        }
+
+        const versions = terminologyVersions || [];
+        const idx = versions.indexOf(currentVersion);
+        const older = idx === -1 ? versions.slice(1) : versions.slice(idx + 1);
+
+        let sameSince = currentVersion;
+        let changedAt = null;
+        const compared = [];
+
+        for (const v of older) {
+          // Skip symbolic labels like 'latest' if encountered in older list
+          if (!v || v.toLowerCase() === 'latest') {
+            continue;
+          }
+          const meta = await fetchEtagForFile(currentFileFolder, v, currentFileName);
+          compared.push(v);
+          if (!meta || !meta.etag) {
+            // Missing file or metadata; treat as change boundary and stop
+            changedAt = v;
+            break;
+          }
+          // Compare on ETag primarily; include size as a minor guard
+          if (meta.etag === currentMeta.etag && (meta.size == null || currentMeta.size == null || meta.size === currentMeta.size)) {
+            sameSince = v;
+            continue;
+          }
+          changedAt = v;
+          break;
+        }
+
+        if (alive) {
+          setFileIdentity({ status: 'ready', sameSince, changedAt, newerChangedAt: null, error: null, compared });
+        }
+      } catch (err) {
+        if (alive) {
+          setFileIdentity({ status: 'error', sameSince: null, changedAt: null, newerChangedAt: null, error: err?.message || 'Failed to compute file history', compared: [] });
+        }
+      }
+    };
+
+    run();
+    return () => { alive = false; };
+  }, [currentFileFolder, currentFileName, terminologyVersion, terminologyVersions, versionedFolders, identityCrosswalk, offlineMode, identityLiveEnabled]);
 
   useEffect(() => {
     if (searchMode !== 'sqlite' || !sqliteEntry) {
@@ -689,16 +1036,17 @@ export default function CSVViewer() {
       };
 
       try {
-        const publicUrl = typeof process !== 'undefined' ? (process.env?.PUBLIC_URL || '') : '';
+        const publicPath = resolvePublicPath();
+        const origin = typeof window !== 'undefined' ? window.location.origin : '';
 
+        // Always prefer local candidates (no remote domains here)
+        addPath(publicPath, '/data/header-crosswalk.json');
+        addPath(publicPath, 'data/header-crosswalk.json');
         addPath('', '/data/header-crosswalk.json');
         addPath('', 'data/header-crosswalk.json');
-        addPath(publicUrl, '/data/header-crosswalk.json');
-        addPath(publicUrl, 'data/header-crosswalk.json');
-
-        if (typeof window !== 'undefined') {
-          addPath(window.location.origin, '/data/header-crosswalk.json');
-          addPath(`${window.location.origin}${publicUrl}`, '/data/header-crosswalk.json');
+        if (origin) {
+          addPath(origin, `${publicPath || ''}/data/header-crosswalk.json`);
+          addPath(origin, '/data/header-crosswalk.json');
         }
 
         let parsed = null;
@@ -735,19 +1083,21 @@ export default function CSVViewer() {
           setHeaderCrosswalk(parsed);
         }
       } catch (err) {
-        console.error('Failed to load header crosswalk map', err);
+        console.warn('Failed to load header crosswalk map', err);
         if (isMounted) {
           setHeaderCrosswalk((previous) => (previous && typeof previous === 'object' ? previous : (headerCrosswalkFallback || null)));
         }
       }
     };
 
-    fetchCrosswalk();
+    if (shouldFetchCrosswalks || offlineMode) {
+      fetchCrosswalk();
+    }
 
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [shouldFetchCrosswalks, offlineMode]);
 
   useEffect(() => {
     let isMounted = true;
@@ -780,6 +1130,9 @@ export default function CSVViewer() {
     if (sourceMode === 'remote') {
       try {
         const base = (typeof baseDomain === 'string' ? baseDomain : DEFAULT_BASE_DOMAIN).replace(/\/$/, '');
+        // Prefer standard app layout first (data/sqlite) for our bucket
+        addCandidate(base);
+        // Also try the legacy public layout for compatibility
         addCandidate(`${base}/terminology_viewer_sqlite/datasets.json`);
       } catch (_) {
         // fall through; the hard-coded fallback is still appended below
@@ -838,6 +1191,7 @@ export default function CSVViewer() {
           console.log('SQLite Catalog:', datasetMap);
           setSqliteCatalogError(null);
           setSqliteCatalogVersion((value) => value + 1);
+          setSqliteCatalogReady(true);
           return;
         } catch (catalogError) {
           lastError = catalogError;
@@ -848,6 +1202,7 @@ export default function CSVViewer() {
         sqliteCatalogRef.current = new Map();
         setSqliteCatalogError(lastError?.message || 'Unable to load SQLite catalog.');
         setSqliteCatalogVersion((value) => value + 1);
+        setSqliteCatalogReady(true);
       }
     };
 
@@ -955,6 +1310,84 @@ export default function CSVViewer() {
 
     return [];
   };
+
+  // Fetch the ETag and Size for a single S3 object via a ListObjectsV2 call scoped to the object key.
+  // This avoids downloading file content and works with the existing listing proxy.
+  const fetchEtagForFile = useCallback(async (folder, version, fileName, baseOverride = null) => {
+    if (!folder || !fileName) {
+      return null;
+    }
+    const isVersionedFolder = versionedFolders.has(folder);
+    const key = isVersionedFolder ? `${folder}/${version}/${fileName}` : `${folder}/${fileName}`;
+    if (!key) {
+      return null;
+    }
+
+    const cacheKey = key;
+    if (etagCacheRef.current.has(cacheKey)) {
+      return etagCacheRef.current.get(cacheKey);
+    }
+
+    const params = new URLSearchParams({ 'list-type': '2', prefix: key });
+    const url = buildListingUrl(folder, params, baseOverride);
+
+    const requestOptions = {
+      cache: 'no-store',
+      headers: { Accept: 'application/xml,text/xml;q=0.9' },
+    };
+
+    let response = await fetch(url, requestOptions);
+    if (response.status === 304) {
+      response = await fetch(url, { ...requestOptions, cache: 'reload' });
+    }
+    if (!response.ok) {
+      throw new Error(`Failed to fetch metadata for ${key}: ${response.status} ${response.statusText}`);
+    }
+    const xmlText = await response.text();
+    if (!xmlText.trim()) {
+      throw new Error('Empty response while fetching object metadata.');
+    }
+
+    const parser = new DOMParser();
+    const xmlDocument = parser.parseFromString(xmlText, 'application/xml');
+    const hasParseError = (
+      xmlDocument.querySelector?.('parsererror') ||
+      xmlDocument.querySelector?.('ParserError') ||
+      getElementsByTag(xmlDocument, 'parsererror')[0] ||
+      getElementsByTag(xmlDocument, 'ParserError')[0]
+    );
+    if (hasParseError) {
+      throw new Error('Unable to parse object metadata response.');
+    }
+
+    const contents = getElementsByTag(xmlDocument, 'Contents');
+    let etag = null;
+    let size = null;
+    for (const node of contents) {
+      const keyNode = getElementsByTag(node, 'Key')[0];
+      const keyText = keyNode?.textContent || '';
+      if (keyText && keyText === key) {
+        const etagNode = getElementsByTag(node, 'ETag')[0];
+        const sizeNode = getElementsByTag(node, 'Size')[0];
+        const rawEtag = etagNode?.textContent || '';
+        etag = rawEtag.replace(/^\"|\"$/g, '');
+        const rawSize = sizeNode?.textContent || '';
+        const parsedSize = Number.parseInt(rawSize, 10);
+        size = Number.isFinite(parsedSize) ? parsedSize : null;
+        break;
+      }
+    }
+
+    if (!etag) {
+      // Not found; cache negative result to avoid repeated calls
+      etagCacheRef.current.set(cacheKey, null);
+      return null;
+    }
+
+    const result = { etag, size };
+    etagCacheRef.current.set(cacheKey, result);
+    return result;
+  }, [buildListingUrl, versionedFolders]);
 
   const toBaseCsvName = useCallback((fileName = '') => {
     const normalizedInput = typeof fileName === 'string' ? fileName : '';
@@ -1349,6 +1782,35 @@ export default function CSVViewer() {
     };
 
     const loadAvailableVersions = async () => {
+      if (offlineMode) {
+        try {
+          const versionSets = versionedSources.map((source) => {
+            const folderEntry = identityCrosswalk && identityCrosswalk[source.folder];
+            const fromFolder = (folderEntry && Array.isArray(folderEntry.versions))
+              ? folderEntry.versions
+              : (identityCrosswalk?._meta?.versionsPerFolder?.[source.folder] || []);
+            return Array.isArray(fromFolder) ? fromFolder : [];
+          });
+          const uniqueVersions = Array.from(new Set(versionSets.flat())).filter(Boolean);
+          const latestLabel = 'latest';
+          const withoutLatest = uniqueVersions.filter((v) => String(v).toLowerCase() !== latestLabel);
+          const normalizeForSort = (value) => value.replace(/_/g, '.');
+          const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+          if (withoutLatest.length > 1) {
+            withoutLatest.sort((a, b) => collator.compare(normalizeForSort(b), normalizeForSort(a)));
+          }
+          const hasLatest = uniqueVersions.some((v) => String(v).toLowerCase() === latestLabel);
+          const orderedVersions = hasLatest ? [...withoutLatest, latestLabel] : withoutLatest;
+          if (!isMounted) return;
+          setTerminologyVersions(orderedVersions);
+          if (orderedVersions.length) {
+            setTerminologyVersion((current) => (current && orderedVersions.includes(current)) ? current : orderedVersions[0]);
+          }
+          return;
+        } finally {
+          if (isMounted) setIsLoadingVersions(false);
+        }
+      }
       setIsLoadingVersions(true);
 
       try {
@@ -1406,7 +1868,7 @@ export default function CSVViewer() {
     return () => {
       isMounted = false;
     };
-  }, [activeCategory, buildListingUrl, getListingBase, setListingBase, versionedSources]);
+  }, [activeCategory, buildListingUrl, getListingBase, setListingBase, versionedSources, offlineMode, identityCrosswalk]);
 
   useEffect(() => {
     if (hasVersionedSources && !terminologyVersion) {
@@ -1430,6 +1892,36 @@ export default function CSVViewer() {
     let listingBase = getListingBase();
 
     const fetchFilesForSource = async (source) => {
+      if (offlineMode) {
+        // Build from identity crosswalk locally
+        const files = [];
+        try {
+          const folderEntry = identityCrosswalk && identityCrosswalk[source.folder];
+          if (!folderEntry || !folderEntry.groups) {
+            return files;
+          }
+          // Resolve effective version (map 'latest' to the newest concrete version)
+          const versionList = Array.isArray(folderEntry.versions) ? folderEntry.versions : [];
+          const concreteLatest = versionList.find((v) => String(v).toLowerCase() !== 'latest') || null;
+          const targetVersion = (String(terminologyVersion || '').toLowerCase() === 'latest')
+            ? (concreteLatest || terminologyVersion)
+            : terminologyVersion;
+          Object.values(folderEntry.groups).forEach((group) => {
+            const matches = (group.history || []).find((h) => h.version === targetVersion);
+            if (!matches || !Array.isArray(matches.segments)) {
+              return;
+            }
+            matches.segments.forEach((seg) => {
+              if (seg && seg.file && !String(seg.file).includes('_compressed')) {
+                files.push(seg.file);
+              }
+            });
+          });
+        } catch (_) {
+          // ignore
+        }
+        return files;
+      }
       const files = [];
       let continuationToken = null;
       const isVersioned = source.type === 'versioned';
@@ -1587,7 +2079,7 @@ export default function CSVViewer() {
     return () => {
       isMounted = false;
     };
-  }, [activeCategory, buildFileGroups, buildListingUrl, getListingBase, hasVersionedSources, setListingBase, terminologyVersion, versionedSources]);
+  }, [activeCategory, buildFileGroups, buildListingUrl, getListingBase, hasVersionedSources, setListingBase, terminologyVersion, versionedSources, offlineMode, identityCrosswalk]);
 
   // Helper function to process CSV string and update state
   const processCsvString = useCallback((csvString, isPartial = false, forceLimit = false) => {
@@ -1764,16 +2256,25 @@ export default function CSVViewer() {
 
   // This effect will trigger whenever terminologyVersion or currentFileName changes
   useEffect(() => {
-    if (!currentFileUrl || sqliteEntry) {
+    if (!currentFileUrl) {
       return;
     }
+    // If SQLite is active, CSV fetch is not needed
     if (searchMode === 'sqlite') {
+      return;
+    }
+    // If we have a dataset id, wait for the SQLite catalog decision
+    if (currentDatasetId && !sqliteCatalogReady) {
+      return;
+    }
+    // If there is a compatible SQLite entry for this dataset, avoid CSV fetch
+    if (sqliteEntry && sqliteIndexCompatible) {
       return;
     }
     fetchAndProcessCSV(currentFileUrl, currentFileName || '');
     // Reset pagination when URL changes
     setCurrentPage(1);
-  }, [currentFileUrl, currentFileName, fetchAndProcessCSV, searchMode, sqliteEntry]);
+  }, [currentFileUrl, currentFileName, fetchAndProcessCSV, searchMode, currentDatasetId, sqliteCatalogReady, sqliteEntry, sqliteIndexCompatible]);
 
   const handleGroupSelect = (groupId) => {
     const group = fileGroups.find((item) => item.id === groupId);
@@ -1934,6 +2435,69 @@ export default function CSVViewer() {
     }
     return `Total rows: ${csvData.length.toLocaleString()}`;
   }, [csvData.length, isPartialData, isSqliteMode, searchSummary, manifest]);
+
+  // History panel no longer displays header crosswalk; only identity ranges.
+
+  const identityDetails = useMemo(() => {
+    const result = { run: null, signature: null, versions: [], available: false };
+    if (!currentFileName || !currentFileFolder) return result;
+    const baseName = toBaseCsvName(currentFileName).toLowerCase();
+    const folderEntry = identityCrosswalk && identityCrosswalk[currentFileFolder];
+    const group = folderEntry && folderEntry.groups && folderEntry.groups[baseName];
+    if (!group) return result;
+
+    // Identity data present for this group
+    result.available = true;
+
+    const runs = Array.isArray(group.runs) ? group.runs : [];
+
+    // 1) Preferred: a run that explicitly lists versions
+    const listedRun = runs.find((r) => Array.isArray(r.versions) && r.versions.includes(terminologyVersion));
+    if (listedRun) {
+      result.run = listedRun;
+      result.signature = listedRun.signature || null;
+      result.versions = Array.isArray(listedRun.versions) ? listedRun.versions : [];
+      return result;
+    }
+
+    // 2) Fallback for legacy crosswalks: use history to derive versions for this signature
+    const history = Array.isArray(group.history) ? group.history : [];
+    const thisVersion = history.find((h) => h && h.version === terminologyVersion);
+    if (thisVersion && thisVersion.signature) {
+      const sig = thisVersion.signature;
+      const members = history.filter((h) => h && h.signature === sig).map((h) => h.version);
+      // Ensure descending order just in case
+      members.sort((a, b) => compareVersionStrings(b, a));
+      result.signature = sig;
+      result.versions = members;
+      result.run = {
+        start: members[0] || null,
+        end: members[members.length - 1] || null,
+        signature: sig,
+        versions: members,
+      };
+      return result;
+    }
+
+    // 3) Last resort: check run start/end range when versions list is missing
+    const byRange = runs.find((r) => (
+      r && typeof r.start === 'string' && typeof r.end === 'string'
+        && compareVersionStrings(r.start, terminologyVersion) >= 0
+        && compareVersionStrings(terminologyVersion, r.end) >= 0
+    ));
+    if (byRange) {
+      result.run = byRange;
+      result.signature = byRange.signature || null;
+      // If history is available, derive explicit version list for display
+      if (history.length && byRange.signature) {
+        const members = history.filter((h) => h && h.signature === byRange.signature).map((h) => h.version);
+        members.sort((a, b) => compareVersionStrings(b, a));
+        result.versions = members;
+      }
+    }
+
+    return result;
+  }, [currentFileFolder, currentFileName, terminologyVersion, identityCrosswalk, toBaseCsvName]);
 
   return (
     <div style={{
@@ -2223,6 +2787,46 @@ export default function CSVViewer() {
                 {selectedGroup.folder === provider_folder ? ' · Provider data' : ''}
               </p>
             )}
+            {versionedFolders.has(currentFileFolder) && currentFileName && (
+              <div style={{ fontSize: '12px', color: '#6b7280', marginTop: '4px', marginBottom: '4px' }}>
+                {fileIdentity.status === 'loading' && (
+                  <span>Checking file history…</span>
+                )}
+                {fileIdentity.status === 'error' && (
+                  <span>History unavailable: {fileIdentity.error}</span>
+                )}
+                {fileIdentity.status === 'ready' && (
+                  fileIdentity.newerChangedAt
+                    ? <span>Newer content in {fileIdentity.newerChangedAt}.</span>
+                    : (
+                      <span>
+                        {`Content is latest available.${fileIdentity.sameSince ? ` Unchanged since ${fileIdentity.sameSince}.` : ''}`}
+                      </span>
+                    )
+                )}
+              </div>
+            )}
+            {/* Simple in-app history viewer toggle */}
+            {currentFileName && (
+              <div style={{ marginTop: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => setIsCrosswalkOpen((v) => !v)}
+                  style={{
+                    appearance: 'none',
+                    border: '1px solid #d1d5db',
+                    backgroundColor: '#ffffff',
+                    color: '#111827',
+                    borderRadius: 6,
+                    padding: '6px 10px',
+                    fontSize: 12,
+                    cursor: 'pointer'
+                  }}
+                >
+                  {isCrosswalkOpen ? 'Hide History' : 'View History'}
+                </button>
+              </div>
+            )}
             {selectedGroup && selectedGroup.files.length > 0 && (
               <div style={{ marginBottom: '8px' }}>
                 <span style={{
@@ -2360,6 +2964,26 @@ export default function CSVViewer() {
                   height: '16px'
                 }} />
               </div>
+
+              {sqliteEntry && !sqliteIndexCompatible && (isSqliteMode || isPartialData) && (
+                <div style={{
+                  marginTop: '4px',
+                  marginBottom: '8px',
+                  fontSize: '12px',
+                  color: '#b45309',
+                  backgroundColor: '#fffbeb',
+                  border: '1px solid #f59e0b',
+                  borderRadius: '6px',
+                  padding: '8px'
+                }}>
+                  This version differs from the indexed content. Full-text search is disabled for historical versions. To search values beyond the preview, switch to the most recent version.
+                  {latestConcreteVersion && (
+                    <div style={{ marginTop: 4, color: '#92400e' }}>
+                      Index covers version: {latestConcreteVersion}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {isSqliteMode && (
                 <div style={{
@@ -2549,6 +3173,146 @@ export default function CSVViewer() {
           )}
         </div>
       </div>
+      {/* History side panel */}
+      {isCrosswalkOpen && currentFileName && (
+        <div style={{
+          position: 'absolute',
+          top: 72,
+          right: 16,
+          bottom: 16,
+          width: 420,
+          background: '#ffffff',
+          border: '1px solid #e5e7eb',
+          borderRadius: 8,
+          boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -4px rgba(0,0,0,0.1)',
+          zIndex: 20,
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden'
+        }}>
+          <div style={{
+            padding: '12px 16px',
+            borderBottom: '1px solid #e5e7eb',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between'
+          }}>
+            <div style={{ display: 'flex', flexDirection: 'column' }}>
+              <strong style={{ fontSize: 14 }}>History</strong>
+              <span style={{ fontSize: 12, color: '#6b7280' }}>
+                {currentFileFolder} · {currentFileName}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsCrosswalkOpen(false)}
+              aria-label="Close"
+              style={{
+                appearance: 'none',
+                border: '1px solid #d1d5db',
+                backgroundColor: '#f9fafb',
+                borderRadius: 6,
+                padding: '4px 8px',
+                cursor: 'pointer',
+                fontSize: 12,
+                color: '#111827'
+              }}
+            >
+              Close
+            </button>
+          </div>
+
+          <div style={{ padding: 16, overflow: 'auto' }}>
+            <div>
+              <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>Same-content ranges</div>
+              {versionedFolders.has(currentFileFolder) ? (
+                (() => {
+                  const folderEntry = identityCrosswalk && identityCrosswalk[currentFileFolder];
+                  const baseName = toBaseCsvName(currentFileName).toLowerCase();
+                  const group = folderEntry && folderEntry.groups && folderEntry.groups[baseName];
+                  const runs = group && Array.isArray(group.runs) ? group.runs : [];
+                  const history = group && Array.isArray(group.history) ? group.history : [];
+
+                  if (!runs.length && !history.length) {
+                    return (
+                      <div style={{ fontSize: 12, color: '#9ca3af' }}>
+                        History data not available.
+                      </div>
+                    );
+                  }
+
+                  // Build ranges; prefer runs if present
+                  const ranges = (runs.length ? runs : [])
+                    .map((r, idx) => ({
+                      start: r.start || (Array.isArray(r.versions) ? r.versions[0] : null),
+                      end: r.end || (Array.isArray(r.versions) ? r.versions[r.versions.length - 1] : null),
+                      versions: Array.isArray(r.versions) ? r.versions : [],
+                      signature: r.signature || null,
+                      key: `${r.signature || 'sig'}-${idx}`,
+                    }))
+                    .filter((r) => r.start || r.end || r.versions.length);
+
+                  // If we have no runs (legacy), derive single range for current signature
+                  if (!ranges.length && history.length) {
+                    const current = history.find((h) => h.version === terminologyVersion);
+                    if (current && current.signature) {
+                      const members = history.filter((h) => h.signature === current.signature).map((h) => h.version);
+                      members.sort((a, b) => compareVersionStrings(b, a));
+                      ranges.push({ start: members[0], end: members[members.length - 1], versions: members, signature: current.signature, key: `legacy-${current.signature}` });
+                    }
+                  }
+
+                  if (!ranges.length) {
+                    return (
+                      <div style={{ fontSize: 12, color: '#9ca3af' }}>
+                        No matching history for this version.
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div style={{ fontSize: 12 }}>
+                      <div style={{ marginBottom: 6 }}>Same-content ranges ({ranges.length}):</div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        {ranges.map((r) => {
+                          const contains = (r.versions && r.versions.includes(terminologyVersion))
+                            || (
+                              r.start && r.end
+                              && compareVersionStrings(r.start, terminologyVersion) >= 0
+                              && compareVersionStrings(terminologyVersion, r.end) >= 0
+                            );
+                          const label = (r.start && r.end && r.start !== r.end)
+                            ? `${r.start} – ${r.end}`
+                            : (r.start || r.end || (r.versions?.[0] ?? 'unknown'));
+                          return (
+                            <div key={r.key} style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              border: '1px solid #e5e7eb',
+                              background: contains ? '#eef2ff' : '#f9fafb',
+                              color: '#111827',
+                              borderRadius: 6,
+                              padding: '6px 10px'
+                            }}>
+                              <div>{label}</div>
+                              {r.signature && (
+                                <div style={{ color: '#6b7280', marginLeft: 8 }}>sig: {r.signature.slice(0, 12)}…</div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })()
+              ) : (
+                <div style={{ fontSize: 12, color: '#9ca3af' }}>History not applicable for this folder.</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

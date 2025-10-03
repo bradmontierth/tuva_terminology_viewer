@@ -11,7 +11,12 @@ root.render(
   </React.StrictMode>
 );
 
-if ('serviceWorker' in navigator) {
+const shouldRegisterSqliteSW = () => {
+  const flag = String(process.env.REACT_APP_DISABLE_SQLITE_SW || '').trim().toLowerCase();
+  return !(flag === '1' || flag === 'true' || flag === 'yes');
+};
+
+if ('serviceWorker' in navigator && shouldRegisterSqliteSW()) {
   window.addEventListener('load', () => {
     const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
     const swUrl = `${publicUrl}/sqlite-sw.js`;
