@@ -316,6 +316,8 @@ export default function CSVViewer() {
   const [filterTerm, setFilterTerm] = useState('');
   const [pageSize, setPageSize] = useState(100);
   const [currentPage, setCurrentPage] = useState(1);
+  const [sortColumnIndex, setSortColumnIndex] = useState(null);
+  const [sortDirection, setSortDirection] = useState(null); // 'asc' | 'desc' | null
   const [isPartialData, setIsPartialData] = useState(false);
   const [terminologyVersion, setTerminologyVersion] = useState(null);
   const [terminologyVersions, setTerminologyVersions] = useState([]);
@@ -2399,17 +2401,53 @@ export default function CSVViewer() {
     );
   }, [csvData, isSqliteMode, normalizedFilterTerm]);
 
-  const totalRows = filteredData.length;
-
-  const paginatedRows = useMemo(() => {
-    if (isSqliteMode) {
+  const sortedData = useMemo(() => {
+    if (sortColumnIndex == null || !Array.isArray(filteredData) || !filteredData.length) {
       return filteredData;
     }
-    const start = (currentPage - 1) * pageSize;
-    return filteredData.slice(start, start + pageSize);
-  }, [filteredData, isSqliteMode, currentPage, pageSize]);
+    const idx = sortColumnIndex;
+    const direction = sortDirection === 'desc' ? -1 : 1;
+    const isEmpty = (v) => v == null || v === '';
+    const toNumber = (v) => {
+      if (typeof v === 'number') return v;
+      const s = String(v).trim();
+      if (!s) return NaN;
+      const n = Number(s);
+      return Number.isFinite(n) ? n : NaN;
+    };
+    const copy = filteredData.slice();
+    copy.sort((a, b) => {
+      const av = a?.[idx];
+      const bv = b?.[idx];
+      const aEmpty = isEmpty(av);
+      const bEmpty = isEmpty(bv);
+      if (aEmpty && bEmpty) return 0;
+      if (aEmpty) return 1; // empty last
+      if (bEmpty) return -1;
+      const an = toNumber(av);
+      const bn = toNumber(bv);
+      if (Number.isFinite(an) && Number.isFinite(bn)) {
+        if (an < bn) return -1 * direction;
+        if (an > bn) return 1 * direction;
+        return 0;
+      }
+      const as = String(av).toLowerCase();
+      const bs = String(bv).toLowerCase();
+      if (as < bs) return -1 * direction;
+      if (as > bs) return 1 * direction;
+      return 0;
+    });
+    return copy;
+  }, [filteredData, sortColumnIndex, sortDirection]);
 
-  const totalPages = isSqliteMode ? 1 : Math.max(1, Math.ceil(totalRows / pageSize));
+  const totalRows = sortedData.length;
+
+  const paginatedRows = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return sortedData.slice(start, start + pageSize);
+  }, [sortedData, currentPage, pageSize]);
+
+  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
 
   const filterInputPlaceholder = isSqliteMode ? 'Search dataset…' : 'Filter content...';
   const filterInputDisabled = isSqliteMode ? previewLoading : loading;
@@ -2435,6 +2473,40 @@ export default function CSVViewer() {
     }
     return `Total rows: ${csvData.length.toLocaleString()}`;
   }, [csvData.length, isPartialData, isSqliteMode, searchSummary, manifest]);
+
+  const handleDownloadSubset = useCallback(() => {
+    try {
+      if (!Array.isArray(headers) || !headers.length) {
+        return;
+      }
+      const rows = Array.isArray(sortedData) ? sortedData : [];
+      if (!rows.length) {
+        return;
+      }
+      const csvString = Papa.unparse({ fields: headers, data: rows });
+      const base = toBaseCsvName(currentFileName || '') || 'subset';
+      const normalizedFilter = (filterTerm || '').trim();
+      let suffix = 'subset';
+      if (isSqliteMode) {
+        suffix = normalizedFilter ? 'search' : 'preview';
+      } else if (isPartialData) {
+        suffix = 'partial';
+      }
+      const filename = `${base}-${suffix}.csv`;
+      const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) {
+      console.error('Failed to download subset', e);
+      try { alert('Failed to download subset CSV.'); } catch (_) { /* ignore */ }
+    }
+  }, [headers, sortedData, currentFileName, isSqliteMode, isPartialData, filterTerm, toBaseCsvName]);
 
   // History panel no longer displays header crosswalk; only identity ranges.
 
@@ -2877,25 +2949,47 @@ export default function CSVViewer() {
               </p>
             )}
           </div>
-          <a
-            href={currentFileUrl || undefined}
-            download
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              color: '#2563eb',
-              fontSize: '14px',
-              textDecoration: 'none'
-            }}
-            aria-disabled={!currentFileUrl}
-          >
-            <Download style={{
-              width: '16px',
-              height: '16px',
-              marginRight: '4px'
-            }} />
-            Download
-          </a>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <button
+              type="button"
+              onClick={handleDownloadSubset}
+              disabled={!headers.length || !sortedData.length}
+              style={{
+                appearance: 'none',
+                border: '1px solid #d1d5db',
+                backgroundColor: '#ffffff',
+                color: (!headers.length || !sortedData.length) ? '#9ca3af' : '#2563eb',
+                borderRadius: 6,
+                padding: '6px 10px',
+                fontSize: 14,
+                cursor: (!headers.length || !sortedData.length) ? 'not-allowed' : 'pointer',
+                display: 'flex',
+                alignItems: 'center'
+              }}
+            >
+              <FileText style={{ width: '16px', height: '16px', marginRight: 6 }} />
+              Download subset
+            </button>
+            <a
+              href={currentFileUrl || undefined}
+              download
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                color: '#2563eb',
+                fontSize: '14px',
+                textDecoration: 'none'
+              }}
+              aria-disabled={!currentFileUrl}
+            >
+              <Download style={{
+                width: '16px',
+                height: '16px',
+                marginRight: '4px'
+              }} />
+              Download
+            </a>
+          </div>
         </div>
         
         <div style={{
@@ -3038,23 +3132,51 @@ export default function CSVViewer() {
                     backgroundColor: '#f9fafb'
                   }}>
                     <tr>
-                      {headers.map((header, index) => (
-                        <th 
-                          key={index}
-                          style={{
-                            padding: '12px 24px',
-                            textAlign: 'left',
-                            fontSize: '12px',
-                            fontWeight: 500,
-                            color: '#6b7280',
-                            textTransform: 'uppercase',
-                            letterSpacing: '0.05em',
-                            borderBottom: '1px solid #e5e7eb'
-                          }}
-                        >
-                          {header}
-                        </th>
-                    ))}
+                      {headers.map((header, index) => {
+                        const active = sortColumnIndex === index && sortDirection;
+                        const indicator = active === 'asc' ? ' ▲' : active === 'desc' ? ' ▼' : '';
+                        return (
+                          <th
+                            key={index}
+                            onClick={() => {
+                              setCurrentPage(1);
+                              setSortColumnIndex((prevIdx) => {
+                                if (prevIdx !== index) {
+                                  setSortDirection('asc');
+                                  return index;
+                                }
+                                // cycle asc -> desc -> none
+                                setSortDirection((prevDir) => {
+                                  if (prevDir === 'asc') return 'desc';
+                                  if (prevDir === 'desc') {
+                                    // clear sort
+                                    return null;
+                                  }
+                                  return 'asc';
+                                });
+                                return index;
+                              });
+                            }}
+                            aria-sort={active ? (sortDirection === 'asc' ? 'ascending' : 'descending') : 'none'}
+                            role="columnheader button"
+                            style={{
+                              padding: '12px 24px',
+                              textAlign: 'left',
+                              fontSize: '12px',
+                              fontWeight: 500,
+                              color: '#6b7280',
+                              textTransform: 'uppercase',
+                              letterSpacing: '0.05em',
+                              borderBottom: '1px solid #e5e7eb',
+                              cursor: 'pointer',
+                              userSelect: 'none'
+                            }}
+                            title="Click to sort"
+                          >
+                            {header}{indicator}
+                          </th>
+                        );
+                      })}
                   </tr>
                 </thead>
                 <tbody>
@@ -3114,7 +3236,6 @@ export default function CSVViewer() {
                         setPageSize(Number(e.target.value));
                         setCurrentPage(1);
                       }}
-                      disabled={isSqliteMode}
                       style={{
                         padding: '4px 8px',
                         border: '1px solid #d1d5db',
@@ -3126,6 +3247,7 @@ export default function CSVViewer() {
                       <option value={100}>100</option>
                       <option value={250}>250</option>
                       <option value={500}>500</option>
+                      <option value={1000}>1000</option>
                     </select>
                   </div>
                   
@@ -3133,15 +3255,15 @@ export default function CSVViewer() {
                     <>
                       <button
                         onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
-                        disabled={isSqliteMode || currentPage === 1}
+                        disabled={currentPage === 1}
                         style={{
                           padding: '4px 8px',
                           border: '1px solid #d1d5db',
                           borderRadius: '4px',
                           marginRight: '8px',
-                          backgroundColor: (isSqliteMode || currentPage === 1) ? '#f3f4f6' : 'white',
-                          cursor: (isSqliteMode || currentPage === 1) ? 'not-allowed' : 'pointer',
-                          color: (isSqliteMode || currentPage === 1) ? '#9ca3af' : '#111827'
+                          backgroundColor: (currentPage === 1) ? '#f3f4f6' : 'white',
+                          cursor: (currentPage === 1) ? 'not-allowed' : 'pointer',
+                          color: (currentPage === 1) ? '#9ca3af' : '#111827'
                         }}
                       >
                         Previous
@@ -3153,14 +3275,14 @@ export default function CSVViewer() {
 
                       <button
                         onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
-                        disabled={isSqliteMode || currentPage >= totalPages}
+                        disabled={currentPage >= totalPages}
                         style={{
                           padding: '4px 8px',
                           border: '1px solid #d1d5db',
                           borderRadius: '4px',
-                          backgroundColor: (isSqliteMode || currentPage >= totalPages) ? '#f3f4f6' : 'white',
-                          cursor: (isSqliteMode || currentPage >= totalPages) ? 'not-allowed' : 'pointer',
-                          color: (isSqliteMode || currentPage >= totalPages) ? '#9ca3af' : '#111827'
+                          backgroundColor: (currentPage >= totalPages) ? '#f3f4f6' : 'white',
+                          cursor: (currentPage >= totalPages) ? 'not-allowed' : 'pointer',
+                          color: (currentPage >= totalPages) ? '#9ca3af' : '#111827'
                         }}
                       >
                         Next
