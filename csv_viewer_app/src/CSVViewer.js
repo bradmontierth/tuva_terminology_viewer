@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Search, Download, FileText, Loader2 } from 'lucide-react';
+import { Search, Download, FileText, Loader2, Filter as FilterIcon, ArrowUpAZ, ArrowDownAZ } from 'lucide-react';
 import * as Papa from 'papaparse';
 import pako from 'pako';
 import JSZip from 'jszip';
@@ -318,6 +318,16 @@ export default function CSVViewer() {
   const [currentPage, setCurrentPage] = useState(1);
   const [sortColumnIndex, setSortColumnIndex] = useState(null);
   const [sortDirection, setSortDirection] = useState(null); // 'asc' | 'desc' | null
+  const [columnFilters, setColumnFilters] = useState({});
+  const [filterPopoverOpen, setFilterPopoverOpen] = useState(false);
+  const [filterPopoverColumn, setFilterPopoverColumn] = useState(null);
+  const [filterDraft, setFilterDraft] = useState({ operator: 'contains', text: '', values: new Set() });
+  const [distinctLoading, setDistinctLoading] = useState(false);
+  const [distinctError, setDistinctError] = useState(null);
+  const [distinctItems, setDistinctItems] = useState([]);
+  const headerRefs = useRef([]);
+  const [filterPopoverPos, setFilterPopoverPos] = useState({ top: 120, left: null });
+  const popoverRef = useRef(null);
   const [isPartialData, setIsPartialData] = useState(false);
   const [terminologyVersion, setTerminologyVersion] = useState(null);
   const [terminologyVersions, setTerminologyVersions] = useState([]);
@@ -369,6 +379,7 @@ export default function CSVViewer() {
   const latestSearchRequestRef = useRef(null);
   const sqliteCatalogRef = useRef(new Map());
   const suppressNextAutoSearchRef = useRef(false);
+  const workerFiltersRef = useRef([]);
 
   const activeCategory = useMemo(
     () => dataCategories.find((category) => category.id === activeCategoryId) || dataCategories[0],
@@ -593,15 +604,47 @@ export default function CSVViewer() {
       return;
     }
     if (!trimmed) {
-      latestSearchRequestRef.current = null;
-      setSearchStatus('idle');
-      setSearchError(null);
-      setSearchSummary(null);
-      setCsvData(sqlitePreview.rows);
-      setColumnCount(sqlitePreview.columns.length);
-      setDefaultHeaders(sqlitePreview.columns.map((name, index) => (name ? formatHeader(name) : `Column ${index + 1}`)));
-      setIsPartialData(true);
-      return;
+      // If there are active column filters, run a filters-only search; otherwise show preview
+      const wf = workerFiltersRef.current || [];
+      if (Array.isArray(wf) && wf.length) {
+        const client = workerClientRef.current;
+        setSearchStatus('loading');
+        const { requestId, promise } = client.search('', { limit: SQLITE_SEARCH_RESULT_LIMIT, filters: wf });
+        latestSearchRequestRef.current = requestId;
+        promise
+          .then((data) => {
+            if (latestSearchRequestRef.current !== data.requestId) return;
+            const baseColumns = sqlitePreview.columns.length
+              ? sqlitePreview.columns
+              : (Array.isArray(manifest.narrowColumns) ? manifest.narrowColumns : []);
+            const effectiveColumns = baseColumns.length ? baseColumns : [];
+            const rows = Array.isArray(data.items)
+              ? data.items.map((item) => effectiveColumns.map((column) => item?.[column] ?? null))
+              : [];
+            setColumnCount(effectiveColumns.length);
+            setDefaultHeaders(effectiveColumns.map((name, index) => (name ? formatHeader(name) : `Column ${index + 1}`)));
+            setCsvData(rows);
+            setIsPartialData(true);
+            setSearchStatus('ready');
+            setSearchSummary({ total: data.total || rows.length, returned: rows.length, elapsedMs: data.elapsedMs, bytesFetched: data.bytesFetched });
+          })
+          .catch((err) => {
+            if (latestSearchRequestRef.current !== requestId) return;
+            setSearchError(err?.message || 'Search failed');
+            setSearchStatus('error');
+          });
+        return;
+      } else {
+        latestSearchRequestRef.current = null;
+        setSearchStatus('idle');
+        setSearchError(null);
+        setSearchSummary(null);
+        setCsvData(sqlitePreview.rows);
+        setColumnCount(sqlitePreview.columns.length);
+        setDefaultHeaders(sqlitePreview.columns.map((name, index) => (name ? formatHeader(name) : `Column ${index + 1}`)));
+        setIsPartialData(true);
+        return;
+      }
     }
 
     const client = workerClientRef.current;
@@ -2390,16 +2433,39 @@ export default function CSVViewer() {
   const normalizedFilterTerm = filterTerm.trim().toLowerCase();
 
   const filteredData = useMemo(() => {
-    if (isSqliteMode) {
-      return csvData;
+    let base = csvData;
+    if (!isSqliteMode && normalizedFilterTerm) {
+      base = base.filter((row) => row.some((cell) => cell && String(cell).toLowerCase().includes(normalizedFilterTerm)));
     }
-    if (!normalizedFilterTerm) {
-      return csvData;
+    if (!isSqliteMode && columnFilters && Object.keys(columnFilters).length) {
+      const entries = Object.entries(columnFilters);
+      base = base.filter((row) => {
+        for (const [idxStr, spec] of entries) {
+          const idx = Number(idxStr);
+          const val = row[idx];
+          if (Array.isArray(spec.values) && spec.values.length) {
+            if (!spec.values.includes(String(val ?? ''))) return false;
+            continue;
+          }
+          const text = (spec.text || '').toLowerCase();
+          if (!text) continue;
+          const s = String(val ?? '').toLowerCase();
+          const op = (spec.operator || 'contains').toLowerCase();
+          if (op === 'equals') {
+            if (s !== text) return false;
+          } else if (op === 'startswith' || op === 'starts') {
+            if (!s.startsWith(text)) return false;
+          } else if (op === 'endswith' || op === 'ends') {
+            if (!s.endsWith(text)) return false;
+          } else {
+            if (!s.includes(text)) return false;
+          }
+        }
+        return true;
+      });
     }
-    return csvData.filter((row) =>
-      row.some((cell) => cell && String(cell).toLowerCase().includes(normalizedFilterTerm))
-    );
-  }, [csvData, isSqliteMode, normalizedFilterTerm]);
+    return base;
+  }, [csvData, isSqliteMode, normalizedFilterTerm, columnFilters]);
 
   const sortedData = useMemo(() => {
     if (sortColumnIndex == null || !Array.isArray(filteredData) || !filteredData.length) {
@@ -2473,6 +2539,162 @@ export default function CSVViewer() {
     }
     return `Total rows: ${csvData.length.toLocaleString()}`;
   }, [csvData.length, isPartialData, isSqliteMode, searchSummary, manifest]);
+
+  const workerFilters = useMemo(() => {
+    if (!columnFilters || !Object.keys(columnFilters).length) return [];
+    const nameByIndex = isSqliteMode && sqlitePreview?.columns?.length ? sqlitePreview.columns : headers;
+    const out = [];
+    for (const [idxStr, spec] of Object.entries(columnFilters)) {
+      const idx = Number(idxStr);
+      const name = nameByIndex?.[idx];
+      if (!name) continue;
+      const entry = { column: name, operator: spec.operator || 'contains' };
+      if (Array.isArray(spec.values) && spec.values.length) {
+        entry.values = spec.values.map((v) => String(v ?? ''));
+      } else if (spec.text) {
+        entry.text = String(spec.text);
+      }
+      out.push(entry);
+    }
+    return out;
+  }, [columnFilters, isSqliteMode, sqlitePreview, headers]);
+
+  useEffect(() => {
+    if (!isSqliteMode || !manifest) return;
+    const trimmed = filterTerm.trim();
+    const hasFilters = Array.isArray(workerFilters) && workerFilters.length > 0;
+    if (!hasFilters && !trimmed) {
+      // No filters and no query: show preview again
+      setSearchStatus('idle');
+      setSearchError(null);
+      setSearchSummary(null);
+      setCsvData(sqlitePreview.rows);
+      setColumnCount(sqlitePreview.columns.length);
+      setDefaultHeaders(sqlitePreview.columns.map((name, index) => (name ? formatHeader(name) : `Column ${index + 1}`)));
+      setIsPartialData(true);
+      return;
+    }
+    const client = workerClientRef.current;
+    if (!client) return;
+    setSearchStatus('loading');
+    const { requestId, promise } = client.search(trimmed, { limit: SQLITE_SEARCH_RESULT_LIMIT, filters: workerFilters });
+    latestSearchRequestRef.current = requestId;
+    promise
+      .then((data) => {
+        if (latestSearchRequestRef.current !== data.requestId) return;
+        const baseColumns = sqlitePreview.columns.length ? sqlitePreview.columns : headers.map((h, i) => `Column ${i + 1}`);
+        const effectiveColumns = baseColumns;
+        const rows = Array.isArray(data.items)
+          ? data.items.map((item) => effectiveColumns.map((column) => item?.[column] ?? null))
+          : [];
+        setCsvData(rows);
+        setColumnCount(effectiveColumns.length);
+        setDefaultHeaders(effectiveColumns.map((name, index) => (name ? formatHeader(name) : `Column ${index + 1}`)));
+        setIsPartialData(true);
+        setSearchStatus('ready');
+        setSearchSummary({ returned: rows.length, total: data.total || rows.length, elapsedMs: data.elapsedMs, bytesFetched: data.bytesFetched });
+      })
+      .catch((err) => {
+        if (latestSearchRequestRef.current !== requestId) return;
+        setSearchStatus('error');
+        setSearchError(err?.message || 'Search failed');
+      });
+  }, [isSqliteMode, manifest, workerFilters, filterTerm, sqlitePreview, headers]);
+
+  useEffect(() => {
+    workerFiltersRef.current = workerFilters;
+  }, [workerFilters]);
+
+  const openFilterForColumn = useCallback(async (colIndex) => {
+    setFilterPopoverColumn(colIndex);
+    const spec = columnFilters[colIndex] || { operator: 'contains', text: '', values: [] };
+    setFilterDraft({ operator: spec.operator || 'contains', text: spec.text || '', values: new Set(spec.values || []) });
+    setDistinctError(null);
+    setDistinctItems([]);
+    setFilterPopoverOpen(true);
+    // Position popover near the column header
+    try {
+      const el = headerRefs.current?.[colIndex] || null;
+      const rect = el ? el.getBoundingClientRect() : null;
+      const width = 320;
+      if (rect) {
+        const top = Math.max(60, Math.min(window.innerHeight - 260, rect.bottom + 6));
+        const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+        setFilterPopoverPos({ top, left });
+      } else {
+        setFilterPopoverPos((p) => ({ ...p, left: window.innerWidth - width - 24 }));
+      }
+    } catch (_) {
+      // ignore
+    }
+    try {
+      setDistinctLoading(true);
+      if (isSqliteMode && workerClientRef.current && sqlitePreview?.columns?.[colIndex]) {
+        const colName = sqlitePreview.columns[colIndex];
+        const otherFilters = workerFilters.filter((f) => f.column !== colName);
+        const { promise } = workerClientRef.current.distinct(colName, { limit: 25, query: filterTerm.trim(), filters: otherFilters });
+        const data = await promise;
+        setDistinctItems(Array.isArray(data.items) ? data.items : []);
+      } else {
+        const counts = new Map();
+        for (const row of csvData) {
+          const v = String(row?.[colIndex] ?? '');
+          counts.set(v, (counts.get(v) || 0) + 1);
+        }
+        const merged = Array.from(counts.entries()).map(([value, count]) => ({ value, count }));
+        merged.sort((a, b) => b.count - a.count);
+        setDistinctItems(merged.slice(0, 25));
+      }
+    } catch (e) {
+      setDistinctError(e?.message || 'Failed to load distinct values');
+    } finally {
+      setDistinctLoading(false);
+    }
+  }, [columnFilters, isSqliteMode, sqlitePreview, workerFilters, filterTerm, csvData]);
+
+  const applyFilterDraft = useCallback(() => {
+    if (filterPopoverColumn == null) return;
+    const idx = filterPopoverColumn;
+    const values = Array.from(filterDraft.values || []);
+    const next = { ...columnFilters };
+    if ((filterDraft.text && filterDraft.text.trim()) || values.length) {
+      next[idx] = { operator: filterDraft.operator || 'contains', text: filterDraft.text || '', values };
+    } else {
+      delete next[idx];
+    }
+    setColumnFilters(next);
+    setFilterPopoverOpen(false);
+    setCurrentPage(1);
+  }, [filterPopoverColumn, filterDraft, columnFilters]);
+
+  const clearFilterForColumn = useCallback(() => {
+    if (filterPopoverColumn == null) return;
+    const idx = filterPopoverColumn;
+    const next = { ...columnFilters };
+    delete next[idx];
+    setColumnFilters(next);
+    // reset draft
+    setFilterDraft({ operator: 'contains', text: '', values: new Set() });
+    setFilterPopoverOpen(false);
+    setCurrentPage(1);
+  }, [filterPopoverColumn, columnFilters]);
+
+  // Dismiss popover on outside click/tap
+  useEffect(() => {
+    if (!filterPopoverOpen) return;
+    const handler = (e) => {
+      const pop = popoverRef.current;
+      if (pop && !pop.contains(e.target)) {
+        setFilterPopoverOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    document.addEventListener('touchstart', handler, { passive: true });
+    return () => {
+      document.removeEventListener('mousedown', handler);
+      document.removeEventListener('touchstart', handler);
+    };
+  }, [filterPopoverOpen]);
 
   const handleDownloadSubset = useCallback(() => {
     try {
@@ -2702,6 +2924,69 @@ export default function CSVViewer() {
           </div>
         )}
       </div>
+
+      {filterPopoverOpen && filterPopoverColumn != null && (
+        <div style={{
+          position: 'fixed',
+          top: filterPopoverPos.top,
+          left: filterPopoverPos.left ?? undefined,
+          right: filterPopoverPos.left == null ? 24 : undefined,
+          zIndex: 50,
+          width: 320,
+          background: 'white',
+          border: '1px solid #e5e7eb',
+          borderRadius: 8,
+          boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -4px rgba(0,0,0,0.1)'
+        }} ref={popoverRef}>
+          <div style={{ padding: 12, borderBottom: '1px solid #e5e7eb', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>Filter: {headers[filterPopoverColumn] || `Column ${filterPopoverColumn + 1}`}</div>
+            <button type="button" onClick={() => setFilterPopoverOpen(false)} style={{ border: 'none', background: 'transparent', color: '#6b7280', cursor: 'pointer' }}>✕</button>
+          </div>
+          <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <select value={filterDraft.operator} onChange={(e) => setFilterDraft((d) => ({ ...d, operator: e.target.value }))} style={{ fontSize: 12, border: '1px solid #d1d5db', borderRadius: 4, padding: '4px 6px' }}>
+                <option value="contains">Contains</option>
+                <option value="equals">Equals</option>
+                <option value="startsWith">Starts with</option>
+                <option value="endsWith">Ends with</option>
+              </select>
+              <input value={filterDraft.text} onChange={(e) => setFilterDraft((d) => ({ ...d, text: e.target.value }))} placeholder="Filter value" style={{ flex: 1, border: '1px solid #d1d5db', borderRadius: 4, padding: '4px 6px', fontSize: 12 }} />
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <button type="button" onClick={() => { setSortColumnIndex(filterPopoverColumn); setSortDirection('asc'); }} style={{ display: 'flex', alignItems: 'center', gap: 4, border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#111827', padding: '4px 6px', fontSize: 12, cursor: 'pointer' }}><ArrowUpAZ style={{ width: 14, height: 14 }} /> Sort A–Z</button>
+              <button type="button" onClick={() => { setSortColumnIndex(filterPopoverColumn); setSortDirection('desc'); }} style={{ display: 'flex', alignItems: 'center', gap: 4, border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#111827', padding: '4px 6px', fontSize: 12, cursor: 'pointer' }}><ArrowDownAZ style={{ width: 14, height: 14 }} /> Sort Z–A</button>
+              <button type="button" onClick={() => { if (sortColumnIndex === filterPopoverColumn) setSortDirection(null); }} style={{ border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#111827', padding: '4px 6px', fontSize: 12, cursor: 'pointer' }}>Clear sort</button>
+            </div>
+            <div style={{ fontSize: 12, color: '#6b7280' }}>Distinct values (top 25)</div>
+            <div style={{ maxHeight: 180, overflowY: 'auto', border: '1px solid #e5e7eb', borderRadius: 4 }}>
+              {distinctLoading ? (
+                <div style={{ padding: 8, fontSize: 12, color: '#6b7280' }}>Loading…</div>
+              ) : distinctError ? (
+                <div style={{ padding: 8, fontSize: 12, color: '#dc2626' }}>{distinctError}</div>
+              ) : distinctItems.length ? (
+                distinctItems.map((item) => (
+                  <label key={`${item.value}`} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '4px 8px', fontSize: 12 }}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <input type="checkbox" checked={filterDraft.values?.has(String(item.value)) || false} onChange={(e) => setFilterDraft((d) => { const next = new Set(d.values || []); const key = String(item.value); e.target.checked ? next.add(key) : next.delete(key); return { ...d, values: next }; })} />
+                      <span style={{ color: '#111827' }}>{String(item.value)}</span>
+                    </span>
+                    <span style={{ color: '#6b7280' }}>{Number(item.count || 0).toLocaleString()}</span>
+                  </label>
+                ))
+              ) : (
+                <div style={{ padding: 8, fontSize: 12, color: '#9ca3af' }}>No values</div>
+              )}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }}>
+              <button type="button" onClick={clearFilterForColumn} style={{ border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#111827', padding: '6px 10px', fontSize: 12, cursor: 'pointer' }}>Clear column</button>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button type="button" onClick={() => setFilterPopoverOpen(false)} style={{ border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#111827', padding: '6px 10px', fontSize: 12, cursor: 'pointer' }}>Cancel</button>
+                <button type="button" onClick={applyFilterDraft} style={{ border: '1px solid #2563eb', borderRadius: 4, background: '#2563eb', color: 'white', padding: '6px 10px', fontSize: 12, cursor: 'pointer' }}>Apply</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Left sidebar with file list */}
       <div style={{
@@ -3115,6 +3400,25 @@ export default function CSVViewer() {
                   )}
                 </div>
               )}
+              {Object.keys(columnFilters).length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <button
+                    type="button"
+                    onClick={() => { setColumnFilters({}); setCurrentPage(1); }}
+                    style={{
+                      border: 'none',
+                      background: 'transparent',
+                      color: '#2563eb',
+                      textDecoration: 'underline',
+                      cursor: 'pointer',
+                      fontSize: 12,
+                      padding: 0
+                    }}
+                  >
+                    Clear all filters
+                  </button>
+                </div>
+              )}
               
               <div style={{
                 overflowY: 'auto',
@@ -3138,6 +3442,7 @@ export default function CSVViewer() {
                         return (
                           <th
                             key={index}
+                            ref={(el) => { headerRefs.current[index] = el; }}
                             onClick={() => {
                               setCurrentPage(1);
                               setSortColumnIndex((prevIdx) => {
@@ -3145,13 +3450,9 @@ export default function CSVViewer() {
                                   setSortDirection('asc');
                                   return index;
                                 }
-                                // cycle asc -> desc -> none
                                 setSortDirection((prevDir) => {
                                   if (prevDir === 'asc') return 'desc';
-                                  if (prevDir === 'desc') {
-                                    // clear sort
-                                    return null;
-                                  }
+                                  if (prevDir === 'desc') return null;
                                   return 'asc';
                                 });
                                 return index;
@@ -3169,16 +3470,37 @@ export default function CSVViewer() {
                               letterSpacing: '0.05em',
                               borderBottom: '1px solid #e5e7eb',
                               cursor: 'pointer',
-                              userSelect: 'none'
+                              userSelect: 'none',
+                              position: 'relative'
                             }}
                             title="Click to sort"
                           >
-                            {header}{indicator}
+                            <span>{header}{indicator}</span>
+                            <button
+                              type="button"
+                              onClick={(e) => { e.stopPropagation(); openFilterForColumn(index); }}
+                              title="Filter column"
+                              style={{
+                                position: 'absolute',
+                                right: 6,
+                                top: '50%',
+                                transform: 'translateY(-50%)',
+                                border: 'none',
+                                background: 'transparent',
+                                padding: 0,
+                                display: 'flex',
+                                alignItems: 'center',
+                                color: columnFilters[index] ? '#1d4ed8' : '#9ca3af',
+                                cursor: 'pointer'
+                              }}
+                            >
+                              <FilterIcon style={{ width: 14, height: 14 }} />
+                            </button>
                           </th>
                         );
                       })}
-                  </tr>
-                </thead>
+                    </tr>
+                  </thead>
                 <tbody>
                     {paginatedRows.length ? paginatedRows.map((row, rowIndex) => (
                       <tr 

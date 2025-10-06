@@ -117,6 +117,14 @@ export default class SearchWorkerClient {
             this.rejectReady = null;
           }
           break;
+        case 'distinct': {
+          const request = this.pendingRequests.get(data.requestId);
+          if (request) {
+            this.pendingRequests.delete(data.requestId);
+            request.resolve(data);
+          }
+          break;
+        }
         case 'results': {
           const request = this.pendingRequests.get(data.requestId);
           if (!request) {
@@ -191,7 +199,7 @@ export default class SearchWorkerClient {
     });
   }
 
-  search(query, { onUpdate, limit } = {}) {
+  search(query, { onUpdate, limit, filters } = {}) {
     const requestId = ++this.requestSeq;
     const promise = new Promise((resolve, reject) => {
       this.pendingRequests.set(requestId, { resolve, reject, onUpdate });
@@ -206,6 +214,7 @@ export default class SearchWorkerClient {
           requestId,
           query,
           limit,
+          filters,
           datasetId: this.datasetId,
         });
       })
@@ -216,6 +225,36 @@ export default class SearchWorkerClient {
         }
         this.pendingRequests.delete(requestId);
         request.reject(error);
+      });
+    return { requestId, promise };
+  }
+
+  distinct(column, { requestId: forcedId, limit = 25, query, filters } = {}) {
+    const requestId = forcedId || ++this.requestSeq;
+    const promise = new Promise((resolve, reject) => {
+      this.pendingRequests.set(requestId, { resolve, reject, onUpdate: null });
+    });
+    this.readyPromise
+      .then(() => {
+        if (!this.pendingRequests.has(requestId)) {
+          return;
+        }
+        this.worker.postMessage({
+          type: 'distinct',
+          requestId,
+          datasetId: this.datasetId,
+          column,
+          limit,
+          query,
+          filters,
+        });
+      })
+      .catch((error) => {
+        const pending = this.pendingRequests.get(requestId);
+        if (pending) {
+          this.pendingRequests.delete(requestId);
+          pending.reject(error);
+        }
       });
     return { requestId, promise };
   }

@@ -2,6 +2,7 @@
 self.importScripts('../sqljs/sqljs-httpvfs.js');
 
 const MAX_RESULTS = 50;
+const DISTINCT_PER_SHARD_LIMIT = 100; // gather more per shard, merge to top N
 const FIRST_BATCH_SIZE = 20;
 const DEFAULT_PAGE_SIZE = 4096;
 const DEFAULT_BYTES_BUDGET = Number.POSITIVE_INFINITY; // unlimited unless caller provides a finite cap
@@ -420,6 +421,96 @@ async function queryShard(shardIndex, normalizedQuery, limit) {
   };
 }
 
+// Helpers for filter support
+function sqlEscapeLiteral(value) {
+  const s = String(value ?? '');
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
+function sqlEscapeLike(value) {
+  const s = String(value ?? '').replace(/[%_]/g, (m) => `\\${m}`);
+  return s;
+}
+
+function buildFiltersWhere(filters, exceptColumn = null) {
+  if (!filters || !Array.isArray(filters) || !filters.length) {
+    return '';
+  }
+  const parts = [];
+  for (const f of filters) {
+    if (!f || !f.column) continue;
+    if (exceptColumn && f.column === exceptColumn) continue;
+    const col = quoteIdentifier(f.column);
+    // Multi-value equals OR clause
+    if (Array.isArray(f.values) && f.values.length) {
+      const uniq = Array.from(new Set(f.values.map((v) => String(v ?? ''))));
+      if (!uniq.length) continue;
+      const list = uniq.map(sqlEscapeLiteral).join(',');
+      parts.push(`${col} IN (${list})`);
+      continue;
+    }
+    const text = typeof f.text === 'string' ? f.text : '';
+    const op = (f.operator || 'contains').toLowerCase();
+    if (!text) continue;
+    const likeVal = sqlEscapeLike(text);
+    if (op === 'equals') {
+      parts.push(`${col} = ${sqlEscapeLiteral(text)}`);
+    } else if (op === 'startswith' || op === 'starts') {
+      parts.push(`${col} LIKE '${likeVal}%'`);
+    } else if (op === 'endswith' || op === 'ends') {
+      parts.push(`${col} LIKE '%${likeVal}'`);
+    } else { // contains
+      parts.push(`${col} LIKE '%${likeVal}%'`);
+    }
+  }
+  return parts.length ? parts.join(' AND ') : '';
+}
+
+async function queryShardWithFilters(shardIndex, normalizedQuery, filters, limit) {
+  let context = await openShard(shardIndex);
+  let { db } = context;
+  const manifest = state.manifest;
+  const narrowColumns = manifest.narrowColumns || [];
+  const matchExpression = buildFtsMatchForQuery(normalizedQuery);
+  const whereFilters = buildFiltersWhere(filters);
+
+  const startStats = await collectShardStats(context);
+  let sql;
+  if (matchExpression) {
+    sql = `SELECT r.rowid, ${narrowColumns.map((c) => quoteIdentifier(c)).join(', ')}
+           FROM t_raw r JOIN t_fts f ON f.rowid = r.rowid
+           WHERE f MATCH '${matchExpression}' ${whereFilters ? `AND ${whereFilters}` : ''}
+           LIMIT ${limit};`;
+  } else if (whereFilters) {
+    sql = `SELECT r.rowid, ${narrowColumns.map((c) => quoteIdentifier(c)).join(', ')}
+           FROM t_raw r
+           WHERE ${whereFilters}
+           LIMIT ${limit};`;
+  } else {
+    // No query and no filters – nothing to do
+    const endStatsEmpty = await collectShardStats(context);
+    return { items: [], stats: { start: startStats, end: endStatsEmpty } };
+  }
+
+  let rows;
+  try {
+    rows = rowsFromExec(await db.exec(sql));
+  } catch (err) {
+    const message = String(err && err.message ? err.message : err || '');
+    if (/io\s*error|ioerr/i.test(message)) {
+      postMessage({ type: 'log', level: 'warn', message: `IO error on shard ${shardIndex}; retrying once (filters)` });
+      context = await reopenShard(shardIndex);
+      rows = rowsFromExec(await context.db.exec(sql));
+    } else {
+      throw err;
+    }
+  }
+
+  const items = rows.map((row) => formatRow(row, narrowColumns));
+  const endStats = await collectShardStats(context);
+  return { items, stats: { start: startStats, end: endStats } };
+}
+
 function accumulateBytes(stats) {
   if (!stats || !stats.start || !stats.end) {
     return 0;
@@ -435,7 +526,7 @@ function accumulateBytes(stats) {
 }
 
 async function handleSearchMessage(payload) {
-  const { requestId, query, limit = MAX_RESULTS, datasetId: requestDatasetId } = payload;
+  const { requestId, query, limit = MAX_RESULTS, datasetId: requestDatasetId, filters } = payload;
   if (!state.manifest) {
     postMessage({ type: 'error', error: 'Search worker is not initialised.', requestId });
     return;
@@ -450,18 +541,21 @@ async function handleSearchMessage(payload) {
 
   const normalized = tokenizeQuery(query || '');
   if (!normalized.tokens.length) {
-    postMessage({
-      type: 'results',
-      requestId,
-      datasetId: state.datasetId,
-      total: 0,
-      items: [],
-      partial: false,
-      elapsedMs: performance.now() - start,
-      bytesFetched: 0,
-      shardsSearched: [],
-    });
-    return;
+    // If there are no tokens but we have column filters, run filters-only query.
+    if (!filters || !filters.length) {
+      postMessage({
+        type: 'results',
+        requestId,
+        datasetId: state.datasetId,
+        total: 0,
+        items: [],
+        partial: false,
+        elapsedMs: performance.now() - start,
+        bytesFetched: 0,
+        shardsSearched: [],
+      });
+      return;
+    }
   }
 
   // For exact numeric IDs (e.g., a 10-digit NPI), cap limit to 1
@@ -470,7 +564,20 @@ async function handleSearchMessage(payload) {
     ? Math.min(1, Number.isFinite(limit) ? Number(limit) : MAX_RESULTS)
     : (Number.isFinite(limit) ? Number(limit) : MAX_RESULTS);
 
-  const shardCandidates = await selectCandidateShards(normalized.ngrams);
+  // Include tokens from filters (for routing) when present
+  const filterTokens = new Set();
+  if (Array.isArray(filters)) {
+    for (const f of filters) {
+      const t = tokenizeQuery((f && f.text) || '').tokens || [];
+      t.forEach((tok) => filterTokens.add(tok));
+    }
+  }
+  const routingGrams = new Set([...(normalized.ngrams || [])]);
+  for (const tok of filterTokens) {
+    const grams = tokenizeQuery(tok).ngrams || [];
+    grams.forEach((g) => routingGrams.add(g));
+  }
+  const shardCandidates = await selectCandidateShards(routingGrams);
   postMessage({ type: 'log', level: 'log', message: `search request ${requestId} shard candidates: ${JSON.stringify(shardCandidates)}` });
   const collected = [];
   const shardStats = [];
@@ -478,7 +585,9 @@ async function handleSearchMessage(payload) {
   const seenRowIds = new Set();
 
   for (const shardIndex of shardCandidates) {
-    const { items, stats } = await queryShard(shardIndex, normalized, effectiveLimit);
+    const { items, stats } = await (normalized.tokens.length
+      ? queryShardWithFilters(shardIndex, normalized, filters, effectiveLimit)
+      : queryShardWithFilters(shardIndex, { tokens: [], ngrams: new Set() }, filters, effectiveLimit));
     shardStats.push(stats);
     for (const item of items) {
       if (seenRowIds.has(item.rowid)) {
@@ -525,6 +634,85 @@ async function handleSearchMessage(payload) {
     elapsedMs: elapsed,
     bytesFetched: totalBytes,
     shardsSearched: shardCandidates,
+  });
+}
+
+async function handleDistinctMessage(payload) {
+  const { requestId, datasetId: requestDatasetId, column, limit = 25, query, filters } = payload;
+  if (!state.manifest) {
+    postMessage({ type: 'error', error: 'Search worker is not initialised.', requestId });
+    return;
+  }
+  if (requestDatasetId && requestDatasetId !== state.datasetId) {
+    postMessage({ type: 'log', level: 'log', message: `dropping stale distinct request ${requestDatasetId}` });
+    return;
+  }
+  const start = performance.now();
+  const normalized = tokenizeQuery(query || '');
+  const whereFilters = buildFiltersWhere(filters, column);
+  const matchExpression = buildFtsMatchForQuery(normalized);
+
+  const tokenSet = new Set([...(normalized.ngrams || [])]);
+  if (Array.isArray(filters)) {
+    for (const f of filters) {
+      const t = tokenizeQuery((f && f.text) || '').ngrams || [];
+      t.forEach((g) => tokenSet.add(g));
+    }
+  }
+  const shardCandidates = await selectCandidateShards(tokenSet);
+
+  const counts = new Map();
+  for (const shardIndex of shardCandidates) {
+    const ctx = await openShard(shardIndex);
+    const { db } = ctx;
+    const col = quoteIdentifier(column);
+    let sql;
+    if (matchExpression) {
+      sql = `SELECT ${col} as value, COUNT(*) as c
+             FROM t_raw r JOIN t_fts f ON f.rowid = r.rowid
+             WHERE f MATCH '${matchExpression}' ${whereFilters ? `AND ${whereFilters}` : ''}
+             GROUP BY ${col}
+             ORDER BY c DESC
+             LIMIT ${DISTINCT_PER_SHARD_LIMIT};`;
+    } else if (whereFilters) {
+      sql = `SELECT ${col} as value, COUNT(*) as c
+             FROM t_raw r
+             WHERE ${whereFilters}
+             GROUP BY ${col}
+             ORDER BY c DESC
+             LIMIT ${DISTINCT_PER_SHARD_LIMIT};`;
+    } else {
+      // No query and no other filters: compute global top per shard
+      sql = `SELECT ${col} as value, COUNT(*) as c
+             FROM t_raw r
+             GROUP BY ${col}
+             ORDER BY c DESC
+             LIMIT ${DISTINCT_PER_SHARD_LIMIT};`;
+    }
+    try {
+      const rows = rowsFromExec(await db.exec(sql));
+      for (const row of rows) {
+        const key = String(row.value ?? '');
+        const prev = counts.get(key) || 0;
+        counts.set(key, prev + (Number(row.c) || 0));
+      }
+    } catch (err) {
+      const message = String(err && err.message ? err.message : err || '');
+      postMessage({ type: 'log', level: 'warn', message: `distinct query failed on shard ${shardIndex}: ${message}` });
+    }
+  }
+
+  const merged = Array.from(counts.entries()).map(([value, count]) => ({ value, count }));
+  merged.sort((a, b) => b.count - a.count);
+  const items = merged.slice(0, Math.max(1, Number(limit) || 25));
+
+  postMessage({
+    type: 'distinct',
+    requestId,
+    datasetId: state.datasetId,
+    column,
+    items,
+    elapsedMs: performance.now() - start,
   });
 }
 
@@ -582,6 +770,11 @@ self.addEventListener('message', (event) => {
       break;
     case 'search':
       handleSearchMessage(data).catch((error) => {
+        postMessage({ type: 'error', error: error.message || String(error), requestId: data.requestId });
+      });
+      break;
+    case 'distinct':
+      handleDistinctMessage(data).catch((error) => {
         postMessage({ type: 'error', error: error.message || String(error), requestId: data.requestId });
       });
       break;
