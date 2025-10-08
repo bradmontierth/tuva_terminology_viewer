@@ -342,6 +342,8 @@ export default function CSVViewer() {
   const [searchSummary, setSearchSummary] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState(null);
+  const [exportingAll, setExportingAll] = useState(false);
+  const [downloadRowCount, setDownloadRowCount] = useState(null);
   const [isCrosswalkOpen, setIsCrosswalkOpen] = useState(false);
   const [manifest, setManifest] = useState(null);
   const [manifestUrl, setManifestUrl] = useState(null);
@@ -719,6 +721,9 @@ export default function CSVViewer() {
     setDefaultHeaders([]);
     setSearchTerm('');
     setFilterTerm('');
+    setColumnFilters({});
+    setFilterPopoverOpen(false);
+    setFilterDraft({ operator: 'contains', text: '', values: new Set() });
     setCurrentPage(1);
     setIsPartialData(false);
     setError(null);
@@ -2330,6 +2335,10 @@ export default function CSVViewer() {
     // Prevent stale auto-search on dataset switch
     suppressNextAutoSearchRef.current = true;
     setSelectedGroupId(groupId);
+    // Clear column filters when switching groups/files
+    setColumnFilters({});
+    setFilterPopoverOpen(false);
+    setFilterDraft({ operator: 'contains', text: '', values: new Set() });
     const nextFile = group.files[0] || null;
     setCurrentFileName(nextFile);
     setCurrentFileFolder(group.folder);
@@ -2348,6 +2357,10 @@ export default function CSVViewer() {
     // Prevent stale auto-search on dataset switch
     suppressNextAutoSearchRef.current = true;
     setSelectedGroupId(groupId);
+    // Clear column filters when switching groups/files
+    setColumnFilters({});
+    setFilterPopoverOpen(false);
+    setFilterDraft({ operator: 'contains', text: '', values: new Set() });
     setCurrentFileName(fileName);
     setCurrentFileFolder(group.folder);
   };
@@ -2360,6 +2373,10 @@ export default function CSVViewer() {
     // Prevent stale auto-search when version changes underneath
     suppressNextAutoSearchRef.current = true;
     setTerminologyVersion(version);
+    // Clear column filters on version change (column positions can shift)
+    setColumnFilters({});
+    setFilterPopoverOpen(false);
+    setFilterDraft({ operator: 'contains', text: '', values: new Set() });
     // The useEffect will automatically trigger and reload the current file with the new version
   };
 
@@ -2559,6 +2576,51 @@ export default function CSVViewer() {
     return out;
   }, [columnFilters, isSqliteMode, sqlitePreview, headers]);
 
+  // Maintain a row count to display on the Download button.
+  useEffect(() => {
+    if (isSqliteMode) {
+      if (!manifest) {
+        setDownloadRowCount(null);
+        return;
+      }
+      const trimmed = (debouncedFilterTerm || '').trim();
+      const hasFilters = Array.isArray(workerFilters) && workerFilters.length > 0;
+      const client = workerClientRef.current;
+      // If no query and no filters, we export the preview rows.
+      if (!hasFilters && !trimmed) {
+        const count = Array.isArray(sqlitePreview?.rows) ? sqlitePreview.rows.length : 0;
+        setDownloadRowCount(count || null);
+        return;
+      }
+      if (!client) {
+        setDownloadRowCount(null);
+        return;
+      }
+      let cancelled = false;
+      const { promise } = client.count(trimmed, { filters: workerFilters });
+      promise
+        .then((data) => {
+          if (cancelled) return;
+          const n = typeof data?.total === 'number' ? data.total : null;
+          setDownloadRowCount(n);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setDownloadRowCount(null);
+        });
+      return () => { cancelled = true; };
+    }
+    // CSV mode: count is simply the current filtered rows length
+    setDownloadRowCount(Array.isArray(sortedData) ? sortedData.length : 0);
+  }, [isSqliteMode, manifest, debouncedFilterTerm, workerFilters, sqlitePreview?.rows?.length, sortedData.length]);
+
+  const hasActiveFiltersOrQuery = useMemo(() => {
+    if (!isSqliteMode) return false;
+    const trimmed = (filterTerm || '').trim();
+    const hasFilters = Array.isArray(workerFilters) && workerFilters.length > 0;
+    return Boolean(trimmed) || hasFilters;
+  }, [isSqliteMode, filterTerm, workerFilters]);
+
   useEffect(() => {
     if (!isSqliteMode || !manifest) return;
     const trimmed = filterTerm.trim();
@@ -2696,24 +2758,142 @@ export default function CSVViewer() {
     };
   }, [filterPopoverOpen]);
 
-  const handleDownloadSubset = useCallback(() => {
+  const handleDownloadSubset = useCallback(async () => {
+    const SQLITE_EXPORT_LIMIT = 100000; // safety cap for large exports
     try {
       if (!Array.isArray(headers) || !headers.length) {
         return;
       }
-      const rows = Array.isArray(sortedData) ? sortedData : [];
-      if (!rows.length) {
+
+      // Helper: apply current sort to a copy of rows
+      const sortRowsIfNeeded = (rows) => {
+        if (sortColumnIndex == null || !Array.isArray(rows) || !rows.length) {
+          return rows;
+        }
+        const idx = sortColumnIndex;
+        const direction = sortDirection === 'desc' ? -1 : 1;
+        const isEmpty = (v) => v == null || v === '';
+        const toNumber = (v) => {
+          if (typeof v === 'number') return v;
+          const s = String(v).trim();
+          if (!s) return NaN;
+          const n = Number(s);
+          return Number.isFinite(n) ? n : NaN;
+        };
+        const copy = rows.slice();
+        copy.sort((a, b) => {
+          const av = a?.[idx];
+          const bv = b?.[idx];
+          const aEmpty = isEmpty(av);
+          const bEmpty = isEmpty(bv);
+          if (aEmpty && bEmpty) return 0;
+          if (aEmpty) return 1; // empty last
+          if (bEmpty) return -1;
+          const an = toNumber(av);
+          const bn = toNumber(bv);
+          if (Number.isFinite(an) && Number.isFinite(bn)) {
+            if (an < bn) return -1 * direction;
+            if (an > bn) return 1 * direction;
+            return 0;
+          }
+          const as = String(av).toLowerCase();
+          const bs = String(bv).toLowerCase();
+          if (as < bs) return -1 * direction;
+          if (as > bs) return 1 * direction;
+          return 0;
+        });
+        return copy;
+      };
+
+      // CSV mode: we already have all filtered rows in memory
+      if (!isSqliteMode) {
+        const rows = Array.isArray(sortedData) ? sortedData : [];
+        if (!rows.length) return;
+        const csvString = Papa.unparse({ fields: headers, data: rows });
+        const base = toBaseCsvName(currentFileName || '') || 'subset';
+        let suffix = isPartialData ? 'partial' : 'subset';
+        const filename = `${base}-${suffix}.csv`;
+        const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
         return;
       }
-      const csvString = Papa.unparse({ fields: headers, data: rows });
-      const base = toBaseCsvName(currentFileName || '') || 'subset';
-      const normalizedFilter = (filterTerm || '').trim();
-      let suffix = 'subset';
-      if (isSqliteMode) {
-        suffix = normalizedFilter ? 'search' : 'preview';
-      } else if (isPartialData) {
-        suffix = 'partial';
+
+      // SQLite mode: fetch all results of current query/filters up to a cap
+      if (!workerClientRef.current) {
+        return;
       }
+      const client = workerClientRef.current;
+      const trimmed = (filterTerm || '').trim();
+      const activeFilters = workerFiltersRef.current || [];
+      const hasFilters = Array.isArray(activeFilters) && activeFilters.length > 0;
+      // If no query and no filters, fall back to preview rows
+      if (!trimmed && !hasFilters) {
+        const rows = Array.isArray(sortedData) ? sortedData : [];
+        if (!rows.length) return;
+        const csvString = Papa.unparse({ fields: headers, data: rows });
+        const base = toBaseCsvName(currentFileName || '') || 'subset';
+        const filename = `${base}-preview.csv`;
+        const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        return;
+      }
+
+      // Preflight count to confirm with user
+      let total = null;
+      try {
+        const { promise: countPromise } = client.count(trimmed, { filters: activeFilters });
+        const countData = await countPromise;
+        if (typeof countData?.total === 'number') {
+          total = countData.total;
+        }
+      } catch (countErr) {
+        // If count fails, proceed without blocking export
+        total = null;
+      }
+
+      if (typeof total === 'number') {
+        const willTruncate = total > SQLITE_EXPORT_LIMIT;
+        const msg = willTruncate
+          ? `Download all ${total.toLocaleString()} rows?\n\nNote: Only the first ${SQLITE_EXPORT_LIMIT.toLocaleString()} rows will be downloaded.`
+          : `Download all ${total.toLocaleString()} rows?`;
+        const ok = typeof window !== 'undefined' && window.confirm ? window.confirm(msg) : true;
+        if (!ok) {
+          return;
+        }
+      }
+
+      setExportingAll(true);
+      const { promise } = client.search(trimmed, { limit: SQLITE_EXPORT_LIMIT, filters: activeFilters });
+      const data = await promise;
+      const baseColumns = sqlitePreview.columns.length
+        ? sqlitePreview.columns
+        : (Array.isArray(manifest?.narrowColumns) ? manifest.narrowColumns : []);
+      const effectiveColumns = baseColumns.length
+        ? baseColumns
+        : (Array.isArray(data.items) && data.items.length
+          ? Object.keys(data.items[0]).filter((k) => k !== 'rowid')
+          : []);
+      const rows = Array.isArray(data.items)
+        ? data.items.map((item) => effectiveColumns.map((column) => item?.[column] ?? null))
+        : [];
+      const sortedRows = sortRowsIfNeeded(rows);
+      const csvString = Papa.unparse({ fields: headers, data: sortedRows });
+      const base = toBaseCsvName(currentFileName || '') || 'subset';
+      const suffix = 'search';
       const filename = `${base}-${suffix}.csv`;
       const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
@@ -2724,11 +2904,17 @@ export default function CSVViewer() {
       link.click();
       document.body.removeChild(link);
       setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+      if (Array.isArray(data.items) && data.items.length >= SQLITE_EXPORT_LIMIT) {
+        try { alert(`Downloaded first ${SQLITE_EXPORT_LIMIT.toLocaleString()} rows. Refine filters to reduce size.`); } catch (_) { /* ignore */ }
+      }
     } catch (e) {
       console.error('Failed to download subset', e);
       try { alert('Failed to download subset CSV.'); } catch (_) { /* ignore */ }
+    } finally {
+      setExportingAll(false);
     }
-  }, [headers, sortedData, currentFileName, isSqliteMode, isPartialData, filterTerm, toBaseCsvName]);
+  }, [headers, sortedData, currentFileName, isSqliteMode, isPartialData, filterTerm, toBaseCsvName, sortColumnIndex, sortDirection, sqlitePreview, manifest]);
 
   // History panel no longer displays header crosswalk; only identity ranges.
 
@@ -3238,22 +3424,30 @@ export default function CSVViewer() {
             <button
               type="button"
               onClick={handleDownloadSubset}
-              disabled={!headers.length || !sortedData.length}
+              disabled={!headers.length || !sortedData.length || exportingAll}
               style={{
                 appearance: 'none',
                 border: '1px solid #d1d5db',
                 backgroundColor: '#ffffff',
-                color: (!headers.length || !sortedData.length) ? '#9ca3af' : '#2563eb',
+                color: (!headers.length || !sortedData.length || exportingAll) ? '#9ca3af' : '#2563eb',
                 borderRadius: 6,
                 padding: '6px 10px',
                 fontSize: 14,
-                cursor: (!headers.length || !sortedData.length) ? 'not-allowed' : 'pointer',
+                cursor: (!headers.length || !sortedData.length || exportingAll) ? 'not-allowed' : 'pointer',
                 display: 'flex',
                 alignItems: 'center'
               }}
             >
               <FileText style={{ width: '16px', height: '16px', marginRight: 6 }} />
-              Download subset
+              {exportingAll ? 'Preparing download…' : (
+                isSqliteMode
+                  ? (
+                      hasActiveFiltersOrQuery
+                        ? (downloadRowCount == null ? 'Download results' : `Download results (${Number(downloadRowCount).toLocaleString()})`)
+                        : (downloadRowCount == null ? 'Download preview' : `Download preview (${Number(downloadRowCount).toLocaleString()})`)
+                    )
+                  : (downloadRowCount == null ? 'Download subset' : `Download subset (${Number(downloadRowCount).toLocaleString()})`)
+              )}
             </button>
             <a
               href={currentFileUrl || undefined}
@@ -3343,6 +3537,28 @@ export default function CSVViewer() {
                   height: '16px'
                 }} />
               </div>
+
+              {isSqliteMode && !hasActiveFiltersOrQuery && (
+                <div style={{
+                  marginTop: '4px',
+                  marginBottom: '8px',
+                  fontSize: '12px',
+                  color: '#6b7280'
+                }}>
+                  Tip: Preview shows up to {(sqlitePreview?.rows?.length || 0).toLocaleString()} rows. Search or add filters to download all matches.
+                </div>
+              )}
+
+              {isSqliteMode && hasActiveFiltersOrQuery && searchSummary && (searchSummary.total > searchSummary.returned) && (
+                <div style={{
+                  marginTop: '4px',
+                  marginBottom: '8px',
+                  fontSize: '12px',
+                  color: '#6b7280'
+                }}>
+                  Matched {searchSummary.total.toLocaleString()} rows. Download will include all matches.
+                </div>
+              )}
 
               {sqliteEntry && !sqliteIndexCompatible && (isSqliteMode || isPartialData) && (
                 <div style={{

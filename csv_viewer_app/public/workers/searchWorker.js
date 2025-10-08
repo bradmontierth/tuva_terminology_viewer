@@ -432,7 +432,7 @@ function sqlEscapeLike(value) {
   return s;
 }
 
-function buildFiltersWhere(filters, exceptColumn = null) {
+function buildFiltersWhere(filters, exceptColumn = null, tableAlias = null) {
   if (!filters || !Array.isArray(filters) || !filters.length) {
     return '';
   }
@@ -440,7 +440,8 @@ function buildFiltersWhere(filters, exceptColumn = null) {
   for (const f of filters) {
     if (!f || !f.column) continue;
     if (exceptColumn && f.column === exceptColumn) continue;
-    const col = quoteIdentifier(f.column);
+    const baseCol = quoteIdentifier(f.column);
+    const col = tableAlias ? `${tableAlias}.${baseCol}` : baseCol;
     // Multi-value equals OR clause
     if (Array.isArray(f.values) && f.values.length) {
       const uniq = Array.from(new Set(f.values.map((v) => String(v ?? ''))));
@@ -472,17 +473,18 @@ async function queryShardWithFilters(shardIndex, normalizedQuery, filters, limit
   const manifest = state.manifest;
   const narrowColumns = manifest.narrowColumns || [];
   const matchExpression = buildFtsMatchForQuery(normalizedQuery);
-  const whereFilters = buildFiltersWhere(filters);
+  const whereFilters = buildFiltersWhere(filters, null, 'r');
 
   const startStats = await collectShardStats(context);
   let sql;
   if (matchExpression) {
-    sql = `SELECT r.rowid, ${narrowColumns.map((c) => quoteIdentifier(c)).join(', ')}
-           FROM t_raw r JOIN t_fts f ON f.rowid = r.rowid
-           WHERE f MATCH '${matchExpression}' ${whereFilters ? `AND ${whereFilters}` : ''}
+    sql = `SELECT r.rowid, ${narrowColumns.map((c) => `r.${quoteIdentifier(c)}`).join(', ')}
+           FROM t_raw r
+           WHERE r.rowid IN (SELECT rowid FROM t_fts WHERE t_fts MATCH '${matchExpression}')
+             ${whereFilters ? `AND ${whereFilters}` : ''}
            LIMIT ${limit};`;
   } else if (whereFilters) {
-    sql = `SELECT r.rowid, ${narrowColumns.map((c) => quoteIdentifier(c)).join(', ')}
+    sql = `SELECT r.rowid, ${narrowColumns.map((c) => `r.${quoteIdentifier(c)}`).join(', ')}
            FROM t_raw r
            WHERE ${whereFilters}
            LIMIT ${limit};`;
@@ -649,8 +651,8 @@ async function handleDistinctMessage(payload) {
   }
   const start = performance.now();
   const normalized = tokenizeQuery(query || '');
-  const whereFilters = buildFiltersWhere(filters, column);
   const matchExpression = buildFtsMatchForQuery(normalized);
+  const whereFilters = buildFiltersWhere(filters, column, 'r');
 
   const tokenSet = new Set([...(normalized.ngrams || [])]);
   if (Array.isArray(filters)) {
@@ -665,12 +667,13 @@ async function handleDistinctMessage(payload) {
   for (const shardIndex of shardCandidates) {
     const ctx = await openShard(shardIndex);
     const { db } = ctx;
-    const col = quoteIdentifier(column);
+    const col = `r.${quoteIdentifier(column)}`;
     let sql;
     if (matchExpression) {
       sql = `SELECT ${col} as value, COUNT(*) as c
-             FROM t_raw r JOIN t_fts f ON f.rowid = r.rowid
-             WHERE f MATCH '${matchExpression}' ${whereFilters ? `AND ${whereFilters}` : ''}
+             FROM t_raw r
+             WHERE r.rowid IN (SELECT rowid FROM t_fts WHERE t_fts MATCH '${matchExpression}')
+               ${whereFilters ? `AND ${whereFilters}` : ''}
              GROUP BY ${col}
              ORDER BY c DESC
              LIMIT ${DISTINCT_PER_SHARD_LIMIT};`;
@@ -713,6 +716,101 @@ async function handleDistinctMessage(payload) {
     column,
     items,
     elapsedMs: performance.now() - start,
+  });
+}
+
+async function handleCountMessage(payload) {
+  const { requestId, datasetId: requestDatasetId, query, filters } = payload;
+  if (!state.manifest) {
+    postMessage({ type: 'error', error: 'Search worker is not initialised.', requestId });
+    return;
+  }
+  if (requestDatasetId && requestDatasetId !== state.datasetId) {
+    postMessage({ type: 'log', level: 'log', message: `dropping stale count request ${requestDatasetId}` });
+    return;
+  }
+
+  const start = performance.now();
+  const normalized = tokenizeQuery(query || '');
+
+  // Build routing grams from query and filters
+  const tokenSet = new Set([...(normalized.ngrams || [])]);
+  if (Array.isArray(filters)) {
+    for (const f of filters) {
+      const t = tokenizeQuery((f && f.text) || '').ngrams || [];
+      t.forEach((g) => tokenSet.add(g));
+    }
+  }
+  const shardCandidates = await selectCandidateShards(tokenSet);
+
+  const matchExpression = buildFtsMatchForQuery(normalized);
+  const whereFilters = buildFiltersWhere(filters, null, 'r');
+
+  // If no query and no filters, align with search behavior: no results to count.
+  if (!matchExpression && !whereFilters) {
+    postMessage({
+      type: 'count',
+      requestId,
+      datasetId: state.datasetId,
+      total: 0,
+      elapsedMs: performance.now() - start,
+      bytesFetched: 0,
+      shardsSearched: shardCandidates,
+    });
+    return;
+  }
+
+  let total = 0;
+  const shardStats = [];
+  for (const shardIndex of shardCandidates) {
+    let context = await openShard(shardIndex);
+    let { db } = context;
+    const startStats = await collectShardStats(context);
+    let sql;
+    if (matchExpression) {
+      sql = `SELECT COUNT(*) as c
+             FROM t_raw r
+             WHERE r.rowid IN (SELECT rowid FROM t_fts WHERE t_fts MATCH '${matchExpression}')
+               ${whereFilters ? `AND ${whereFilters}` : ''};`;
+    } else {
+      sql = `SELECT COUNT(*) as c
+             FROM t_raw r
+             WHERE ${whereFilters};`;
+    }
+    try {
+      const rows = rowsFromExec(await db.exec(sql));
+      const c = Number(rows?.[0]?.c || 0);
+      total += Number.isFinite(c) ? c : 0;
+    } catch (err) {
+      const message = String(err && err.message ? err.message : err || '');
+      if (/io\s*error|ioerr/i.test(message)) {
+        try {
+          context = await reopenShard(shardIndex);
+          const rows = rowsFromExec(await context.db.exec(sql));
+          const c = Number(rows?.[0]?.c || 0);
+          total += Number.isFinite(c) ? c : 0;
+        } catch (err2) {
+          postMessage({ type: 'log', level: 'warn', message: `count failed on shard ${shardIndex}: ${String(err2 && err2.message ? err2.message : err2)}` });
+        }
+      } else {
+        postMessage({ type: 'log', level: 'warn', message: `count failed on shard ${shardIndex}: ${message}` });
+      }
+    }
+    const endStats = await collectShardStats(context);
+    shardStats.push({ start: startStats, end: endStats });
+  }
+
+  const elapsed = performance.now() - start;
+  const totalBytes = shardStats.reduce((sum, entry) => sum + accumulateBytes(entry), 0);
+
+  postMessage({
+    type: 'count',
+    requestId,
+    datasetId: state.datasetId,
+    total,
+    elapsedMs: elapsed,
+    bytesFetched: totalBytes,
+    shardsSearched: shardCandidates,
   });
 }
 
@@ -775,6 +873,11 @@ self.addEventListener('message', (event) => {
       break;
     case 'distinct':
       handleDistinctMessage(data).catch((error) => {
+        postMessage({ type: 'error', error: error.message || String(error), requestId: data.requestId });
+      });
+      break;
+    case 'count':
+      handleCountMessage(data).catch((error) => {
         postMessage({ type: 'error', error: error.message || String(error), requestId: data.requestId });
       });
       break;
