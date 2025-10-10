@@ -41,6 +41,20 @@ module.exports = function configure(app) {
     })
   );
 
+  // Optional: proxy local API in dev to avoid CORS
+  const apiTarget = (process.env.REACT_APP_DEV_API_PROXY || '').trim();
+  if (apiTarget) {
+    app.use(
+      ['/search', '/count', '/distinct'],
+      createProxyMiddleware({
+        target: apiTarget,
+        changeOrigin: true,
+        secure: false,
+        logLevel: 'warn',
+      })
+    );
+  }
+
   // For locally served .sqlite files, set headers to preserve range semantics.
   app.use((req, res, next) => {
     if (/\/data\/sqlite\/.*\.sqlite(\?.*)?$/i.test(req.url)) {

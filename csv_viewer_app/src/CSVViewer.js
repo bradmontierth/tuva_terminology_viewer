@@ -32,10 +32,13 @@ const arraysEqual = (a = [], b = []) => {
 };
 
 const CSV_TEXT_LIMIT = 5000000; // 5MB of text before limiting rows
-const SQLITE_SEARCH_RESULT_LIMIT = 50;
+// Default number of rows to return from SQLite search. Make configurable.
+const SQLITE_SEARCH_RESULT_LIMIT = Number(process.env.REACT_APP_SQLITE_SEARCH_LIMIT || 1000);
 // Increase default cache budget to reduce eviction churn on large shards
 const SQLITE_BYTES_BUDGET = 128 * 1024 * 1024; // 128MB
 const DEFAULT_BASE_DOMAIN = 'https://tuva-public-resources.s3.amazonaws.com';
+// Debounce interval (ms) for free-text dataset search; override with REACT_APP_SEARCH_DEBOUNCE_MS
+const SEARCH_DEBOUNCE_MS = Number(process.env.REACT_APP_SEARCH_DEBOUNCE_MS) || 350;
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0']);
 
 const isPrivateIPv4 = (octets) => {
@@ -222,27 +225,57 @@ const extractCsvFromZip = async (arrayBuffer, preferredName = '') => {
 };
 
 const deriveDatasetId = (fileName) => {
-  if (!fileName) {
-    return null;
+  if (!fileName) return null;
+  let base = String(fileName).trim();
+  if (!base) return null;
+  // Normalize master compressed filenames to the logical base name
+  // e.g., provider_compressed.csv[.gz] -> provider[.gz]
+  base = base.replace(/_compressed(?:\.csv(?:\.gz)?)$/i, (m) => m.replace(/_compressed/i, ''));
+
+  // Extract the dataset id without any CSV/chunk/gzip suffixes.
+  // Handles:
+  //   name.csv
+  //   name.csv.gz
+  //   name.csv_0_0_0.csv.gz
+  const match = base.match(/^(.*?)(?:\.csv(?:_[0-9]+(?:_[0-9]+)*)?\.csv\.gz|\.csv\.gz|\.csv)$/i);
+  if (match && match[1]) {
+    return match[1];
   }
-  let base = fileName;
-  if (base.endsWith('.gz')) {
-    base = base.slice(0, -3);
-  }
-  if (base.endsWith('.zip')) {
-    base = base.slice(0, -4);
-  }
-  while (base.endsWith('.csv')) {
-    base = base.slice(0, -4);
-  }
-  const chunkMatch = base.match(/(.+?)_\d+_\d+_\d+$/);
-  if (chunkMatch) {
-    base = chunkMatch[1];
-  }
-  if (base.endsWith('.csv')) {
-    base = base.slice(0, -4);
-  }
+
+  // As a conservative fallback, strip a trailing .gz or .csv if present
+  base = base.replace(/\.csv\.gz$/i, '').replace(/\.csv$/i, '').replace(/\.gz$/i, '');
   return base || null;
+};
+
+// Pure helper to map a CSV segment or archive name to its base CSV name.
+// Examples:
+//   provider.csv_0_0_0.csv.gz -> provider.csv
+//   provider.csv.gz            -> provider.csv
+//   provider_compressed.csv    -> provider.csv
+//   foo.csv                    -> foo.csv
+const toBaseCsvNamePure = (fileName = '') => {
+  const normalizedInput = typeof fileName === 'string' ? fileName : '';
+  let normalized = normalizedInput.trim();
+  if (!normalized) {
+    return '';
+  }
+
+  // Normalize master compressed filenames to base dataset names
+  // e.g., provider_compressed.csv[.gz] -> provider.csv[.gz]
+  normalized = normalized
+    .replace(/_compressed\.csv\.gz$/i, '.csv.gz')
+    .replace(/_compressed\.csv$/i, '.csv');
+
+  const match = normalized.match(/^(.*?\.csv)(?:_[0-9]+(?:_[0-9]+)*)?\.csv\.gz$/i);
+  if (match) {
+    return match[1];
+  }
+
+  if (/\.csv\.gz$/i.test(normalized)) {
+    return normalized.replace(/\.csv\.gz$/i, '.csv');
+  }
+
+  return normalized;
 };
 
 export default function CSVViewer() {
@@ -336,6 +369,7 @@ export default function CSVViewer() {
   const [versionLoadError, setVersionLoadError] = useState(null);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [fileLoadError, setFileLoadError] = useState(null);
+  const [showUnreleased, setShowUnreleased] = useState(false);
   const [searchMode, setSearchMode] = useState('inMemory');
   const [searchStatus, setSearchStatus] = useState('idle');
   const [searchError, setSearchError] = useState(null);
@@ -393,8 +427,30 @@ export default function CSVViewer() {
   );
   const hasVersionedSources = versionedSources.length > 0;
 
+  // Latest published version (from header crosswalk Git tags) and flags for unreleased content
+  const publishedLatestVersion = useMemo(() => {
+    const v = headerCrosswalk && headerCrosswalk._meta && (headerCrosswalk._meta.latestVersion || headerCrosswalk._meta.latest);
+    return v || null;
+  }, [headerCrosswalk]);
+
+  const publishedVersionsForFolder = useMemo(() => {
+    const folder = currentFileFolder ? String(currentFileFolder).toLowerCase() : null;
+    if (!folder || !headerCrosswalk || typeof headerCrosswalk !== 'object') return new Set();
+    const entry = headerCrosswalk[folder];
+    const versions = entry && typeof entry === 'object' ? Object.keys(entry) : [];
+    return new Set(Array.isArray(versions) ? versions : []);
+  }, [headerCrosswalk, currentFileFolder]);
+
+  const isUnreleasedSelection = useMemo(() => {
+    const v = String(terminologyVersion || '').trim();
+    if (!v) return false;
+    if (v.toLowerCase() === 'latest') return true;
+    // Consider unpublished if not present in the crosswalk versions for this folder
+    return !publishedVersionsForFolder.has(v);
+  }, [terminologyVersion, publishedVersionsForFolder]);
+
   const currentDatasetId = useMemo(() => deriveDatasetId(currentFileName), [currentFileName]);
-  const debouncedFilterTerm = useDebouncedValue(filterTerm, 250, currentDatasetId, '');
+  const debouncedFilterTerm = useDebouncedValue(filterTerm, SEARCH_DEBOUNCE_MS, currentDatasetId, '');
   const sqliteEntry = useMemo(() => {
     if (!currentDatasetId) {
       return null;
@@ -473,7 +529,16 @@ export default function CSVViewer() {
     }
 
     if (!workerClientRef.current) {
-      workerClientRef.current = new SearchWorkerClient();
+      const backend = (process.env.REACT_APP_SEARCH_BACKEND || '').trim().toLowerCase();
+      if (backend === 'api') {
+        // Lazy load to avoid bundling when unused
+        const mod = await import('./lib/SearchApiClient');
+        const ApiClient = mod.default;
+        const apiBase = (process.env.REACT_APP_SEARCH_API_BASE_URL || '').trim();
+        workerClientRef.current = new ApiClient({ apiBase });
+      } else {
+        workerClientRef.current = new SearchWorkerClient();
+      }
     }
 
     const initVersion = workerInitVersionRef.current + 1;
@@ -657,15 +722,9 @@ export default function CSVViewer() {
     setSearchStatus('loading');
     setSearchError(null);
 
-    const isLikelyNpi = (() => {
-      const digitsOnly = trimmed.replace(/\D+/g, '');
-      return digitsOnly.length === 10;
-    })();
-
-    const dynamicLimit = isLikelyNpi ? 1 : SQLITE_SEARCH_RESULT_LIMIT;
-
     const { requestId, promise } = client.search(trimmed, {
-      limit: dynamicLimit,
+      limit: SQLITE_SEARCH_RESULT_LIMIT,
+      filters: Array.isArray(workerFiltersRef.current) ? workerFiltersRef.current : [],
     });
     latestSearchRequestRef.current = requestId;
 
@@ -752,7 +811,7 @@ export default function CSVViewer() {
 
   useEffect(() => {
     latestSearchRequestRef.current = null;
-    if (sqliteEntry && sqliteIndexCompatible) {
+    if (sqliteEntry) {
       // Switching to a SQLite-backed dataset: ensure we don't auto-search using
       // the previous dataset's query.
       suppressNextAutoSearchRef.current = true;
@@ -772,7 +831,7 @@ export default function CSVViewer() {
     setSearchStatus('idle');
     setSearchError(null);
     setSearchSummary(null);
-  }, [sqliteEntry, sqliteIndexCompatible]);
+  }, [sqliteEntry]);
 
   // Compute sameness across older versions for the currently selected file.
   useEffect(() => {
@@ -1065,6 +1124,11 @@ export default function CSVViewer() {
       suppressNextAutoSearchRef.current = false;
       return;
     }
+    const t = (debouncedFilterTerm || '').trim();
+    if (t && t.length < 2) {
+      // Enforce 2+ character minimum for auto-search
+      return;
+    }
     executeSqliteSearch(debouncedFilterTerm);
   }, [searchMode, manifest, debouncedFilterTerm, executeSqliteSearch]);
 
@@ -1176,17 +1240,16 @@ export default function CSVViewer() {
       && isLocalHostname(window.location.hostname);
 
     // If explicitly forcing remote, prioritise the remote catalog first.
+    // Important: do NOT use resolveBaseDomain() here when on localhost — it
+    // returns the local origin, not the actual remote bucket. Instead, use
+    // the configured data base URL (when provided) or the known S3 default.
     const sourceMode = getSqliteSourceMode();
     if (sourceMode === 'remote') {
-      try {
-        const base = (typeof baseDomain === 'string' ? baseDomain : DEFAULT_BASE_DOMAIN).replace(/\/$/, '');
-        // Prefer standard app layout first (data/sqlite) for our bucket
-        addCandidate(base);
-        // Also try the legacy public layout for compatibility
-        addCandidate(`${base}/terminology_viewer_sqlite/datasets.json`);
-      } catch (_) {
-        // fall through; the hard-coded fallback is still appended below
-      }
+      const remoteBase = (process.env.REACT_APP_DATA_BASE_URL || DEFAULT_BASE_DOMAIN).replace(/\/$/, '');
+      // Prefer standard app layout first (data/sqlite) for our bucket
+      addCandidate(remoteBase);
+      // Also try the legacy public layout for compatibility
+      addCandidate(`${remoteBase}/terminology_viewer_sqlite/datasets.json`);
     }
 
     addCandidate('data/sqlite/datasets.json');
@@ -1439,24 +1502,7 @@ export default function CSVViewer() {
     return result;
   }, [buildListingUrl, versionedFolders]);
 
-  const toBaseCsvName = useCallback((fileName = '') => {
-    const normalizedInput = typeof fileName === 'string' ? fileName : '';
-    const normalized = normalizedInput.trim();
-    if (!normalized) {
-      return '';
-    }
-
-    const match = normalized.match(/^(.*?\.csv)(?:_[0-9]+(?:_[0-9]+)*)?\.csv\.gz$/i);
-    if (match) {
-      return match[1];
-    }
-
-    if (normalized.endsWith('.csv.gz')) {
-      return normalized.replace(/\.csv\.gz$/i, '.csv');
-    }
-
-    return normalized;
-  }, []);
+  const toBaseCsvName = useCallback((fileName = '') => toBaseCsvNamePure(fileName), []);
 
   const isLatestVersion = (value = '') => normalizeKey(value) === 'latest';
 
@@ -1639,10 +1685,18 @@ export default function CSVViewer() {
       group.files.push(fileName);
     });
 
-    const sortedGroups = Array.from(groups.values()).map((group) => ({
-      ...group,
-      files: group.files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true })),
-    }));
+    const sortedGroups = Array.from(groups.values()).map((group) => {
+      // De-duplicate: if chunked segments exist, hide any *_compressed* master files
+      const hasChunked = group.files.some((f) => /_\d+(?:_\d+)*\.csv\.gz$/i.test(f));
+      let files = group.files.slice();
+      if (hasChunked) {
+        files = files.filter((f) => !/_compressed\.csv(?:\.gz)?$/i.test(f));
+      }
+      return {
+        ...group,
+        files: files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true })),
+      };
+    });
 
     sortedGroups.sort((a, b) => {
       if (a.folder === b.folder) {
@@ -1854,7 +1908,14 @@ export default function CSVViewer() {
           if (!isMounted) return;
           setTerminologyVersions(orderedVersions);
           if (orderedVersions.length) {
-            setTerminologyVersion((current) => (current && orderedVersions.includes(current)) ? current : orderedVersions[0]);
+            setTerminologyVersion((current) => {
+              if (current && orderedVersions.includes(current)) return current;
+              // Prefer the latest published tag if available
+              if (publishedLatestVersion && orderedVersions.includes(publishedLatestVersion)) {
+                return publishedLatestVersion;
+              }
+              return orderedVersions[0];
+            });
           }
           return;
         } finally {
@@ -1891,6 +1952,9 @@ export default function CSVViewer() {
         if (orderedVersions.length) {
           setTerminologyVersion((current) => {
             if (!userSelectedVersionRef.current) {
+              if (publishedLatestVersion && orderedVersions.includes(publishedLatestVersion)) {
+                return publishedLatestVersion;
+              }
               return orderedVersions[0];
             }
 
@@ -1898,7 +1962,9 @@ export default function CSVViewer() {
               return current;
             }
 
-            return orderedVersions[0];
+            return (publishedLatestVersion && orderedVersions.includes(publishedLatestVersion))
+              ? publishedLatestVersion
+              : orderedVersions[0];
           });
         }
       } catch (err) {
@@ -1973,100 +2039,113 @@ export default function CSVViewer() {
         return files;
       }
       const files = [];
-      let continuationToken = null;
       const isVersioned = source.type === 'versioned';
       const excludedPrefixes = Array.isArray(source.excludedPrefixes) ? source.excludedPrefixes : [];
-      const prefixBase = isVersioned
-        ? `${source.folder}/${terminologyVersion}/`
+      // Determine effective version for this source, falling back when the selected
+      // version isn't available for the folder (e.g., provider may lag a tag).
+      let effectiveVersion = terminologyVersion;
+      if (isVersioned) {
+        try {
+          const folderEntry = identityCrosswalk && identityCrosswalk[source.folder];
+          const available = (folderEntry && Array.isArray(folderEntry.versions))
+            ? folderEntry.versions
+            : (identityCrosswalk?._meta?.versionsPerFolder?.[source.folder] || []);
+          if (effectiveVersion && Array.isArray(available) && available.length && !available.includes(effectiveVersion)) {
+            const versionKeys = available.slice();
+            const withoutLatest = versionKeys.filter((v) => String(v).toLowerCase() !== 'latest');
+            const sorted = withoutLatest.slice().sort((a, b) => compareVersionStrings(b, a));
+            const fallback = sorted.find((v) => compareVersionStrings(v, effectiveVersion) <= 0)
+              || (available.includes('latest') ? 'latest' : (sorted[0] || versionKeys[0]));
+            effectiveVersion = fallback;
+          }
+        } catch (_) {
+          // ignore and use the selected terminologyVersion
+        }
+      }
+      const listForPrefixBase = async (prefixBaseToUse) => {
+        let continuationToken = null;
+        do {
+          const params = new URLSearchParams({
+            'list-type': '2',
+            prefix: prefixBaseToUse,
+          });
+          if (continuationToken) {
+            params.append('continuation-token', continuationToken);
+          }
+          const url = buildListingUrl(source.folder, params.toString(), listingBase);
+          const requestOptions = {
+            cache: 'no-store',
+            headers: { Accept: 'application/xml,text/xml;q=0.9' },
+          };
+          let response = await fetch(url, requestOptions);
+          if (response.status === 304) {
+            response = await fetch(url, { ...requestOptions, cache: 'reload' });
+          }
+          if (!response.ok) {
+            throw new Error(`Failed to list files for ${source.folder}: ${response.status} ${response.statusText}`);
+          }
+          if (typeof DOMParser === 'undefined') {
+            throw new Error('DOMParser is not available in this environment.');
+          }
+          const xmlText = await response.text();
+          if (!xmlText.trim()) {
+            throw new Error('Received empty file listing response.');
+          }
+          const contentType = response.headers.get('content-type') || '';
+          if (!contentType.includes('xml') && /^\s*<!doctype\s+html/i.test(xmlText)) {
+            if (listingBase !== baseDomain) {
+              listingBase = baseDomain;
+              setListingBase(baseDomain);
+              continue;
+            }
+            throw new Error('Received HTML instead of XML when listing files.');
+          }
+          const parser = new DOMParser();
+          const xmlDocument = parser.parseFromString(xmlText, 'application/xml');
+          const hasParseError = (
+            xmlDocument.querySelector?.('parsererror') ||
+            xmlDocument.querySelector?.('ParserError') ||
+            getElementsByTag(xmlDocument, 'parsererror')[0] ||
+            getElementsByTag(xmlDocument, 'ParserError')[0]
+          );
+          if (hasParseError) {
+            throw new Error('Unable to parse file listing response.');
+          }
+          const contentsNodes = getElementsByTag(xmlDocument, 'Contents');
+          contentsNodes.forEach((node) => {
+            const keyNode = getElementsByTag(node, 'Key')[0];
+            const keyText = keyNode?.textContent || '';
+            if (!keyText || keyText.endsWith('/')) return;
+            if (excludedPrefixes.some((prefix) => keyText.startsWith(prefix))) return;
+            let relative = keyText;
+            if (relative.startsWith(prefixBaseToUse)) {
+              relative = relative.slice(prefixBaseToUse.length);
+            }
+            relative = relative.trim();
+            if (relative) files.push(relative);
+          });
+          const isTruncated = getElementsByTag(xmlDocument, 'IsTruncated')[0]?.textContent === 'true';
+          continuationToken = isTruncated
+            ? getElementsByTag(xmlDocument, 'NextContinuationToken')[0]?.textContent || null
+            : null;
+        } while (continuationToken);
+      };
+
+      // First attempt: selected or effective version
+      const initialPrefix = isVersioned
+        ? `${source.folder}/${effectiveVersion}/`
         : `${source.folder}/`;
+      await listForPrefixBase(initialPrefix);
 
-      do {
-        const params = new URLSearchParams({
-          'list-type': '2',
-          prefix: prefixBase,
-        });
-
-        if (continuationToken) {
-          params.append('continuation-token', continuationToken);
+      // Fallback: for versioned sources with no results, try 'latest'
+      if (isVersioned && !files.length && String(effectiveVersion || '').toLowerCase() !== 'latest') {
+        const fallbackPrefix = `${source.folder}/latest/`;
+        try {
+          await listForPrefixBase(fallbackPrefix);
+        } catch (_) {
+          // ignore and return whatever we have
         }
-
-        const url = buildListingUrl(source.folder, params.toString(), listingBase);
-        const requestOptions = {
-          cache: 'no-store',
-          headers: {
-            Accept: 'application/xml,text/xml;q=0.9',
-          },
-        };
-
-        let response = await fetch(url, requestOptions);
-
-        if (response.status === 304) {
-          response = await fetch(url, { ...requestOptions, cache: 'reload' });
-        }
-
-        if (!response.ok) {
-          throw new Error(`Failed to list files for ${source.folder}: ${response.status} ${response.statusText}`);
-        }
-
-        if (typeof DOMParser === 'undefined') {
-          throw new Error('DOMParser is not available in this environment.');
-        }
-
-        const xmlText = await response.text();
-
-        if (!xmlText.trim()) {
-          throw new Error('Received empty file listing response.');
-        }
-
-        const contentType = response.headers.get('content-type') || '';
-        if (!contentType.includes('xml') && /^\s*<!doctype\s+html/i.test(xmlText)) {
-          if (listingBase !== baseDomain) {
-            listingBase = baseDomain;
-            setListingBase(baseDomain);
-            continue;
-          }
-          throw new Error('Received HTML instead of XML when listing files.');
-        }
-
-        const parser = new DOMParser();
-        const xmlDocument = parser.parseFromString(xmlText, 'application/xml');
-
-        const hasParseError = (
-          xmlDocument.querySelector?.('parsererror') ||
-          xmlDocument.querySelector?.('ParserError') ||
-          getElementsByTag(xmlDocument, 'parsererror')[0] ||
-          getElementsByTag(xmlDocument, 'ParserError')[0]
-        );
-
-        if (hasParseError) {
-          throw new Error('Unable to parse file listing response.');
-        }
-
-        const contentsNodes = getElementsByTag(xmlDocument, 'Contents');
-        contentsNodes.forEach((node) => {
-          const keyNode = getElementsByTag(node, 'Key')[0];
-          const keyText = keyNode?.textContent || '';
-          if (!keyText || keyText.endsWith('/') || keyText.includes('_compressed')) {
-            return;
-          }
-          if (excludedPrefixes.some((prefix) => keyText.startsWith(prefix))) {
-            return;
-          }
-          let relative = keyText;
-          if (relative.startsWith(prefixBase)) {
-            relative = relative.slice(prefixBase.length);
-          }
-          relative = relative.trim();
-          if (relative) {
-            files.push(relative);
-          }
-        });
-
-        const isTruncated = getElementsByTag(xmlDocument, 'IsTruncated')[0]?.textContent === 'true';
-        continuationToken = isTruncated
-          ? getElementsByTag(xmlDocument, 'NextContinuationToken')[0]?.textContent || null
-          : null;
-      } while (continuationToken);
+      }
 
       return files;
     };
@@ -2317,8 +2396,8 @@ export default function CSVViewer() {
     if (currentDatasetId && !sqliteCatalogReady) {
       return;
     }
-    // If there is a compatible SQLite entry for this dataset, avoid CSV fetch
-    if (sqliteEntry && sqliteIndexCompatible) {
+    // If there is any SQLite entry for this dataset, avoid CSV fetch
+    if (sqliteEntry) {
       return;
     }
     fetchAndProcessCSV(currentFileUrl, currentFileName || '');
@@ -2437,9 +2516,25 @@ export default function CSVViewer() {
 
   const selectedGroup = fileGroups.find((group) => group.id === selectedGroupId) || null;
 
-  const availableVersions = terminologyVersions.length
-    ? terminologyVersions
-    : (terminologyVersion ? [terminologyVersion] : []);
+  const availableVersions = useMemo(() => {
+    const base = terminologyVersions.length
+      ? terminologyVersions
+      : (terminologyVersion ? [terminologyVersion] : []);
+    if (showUnreleased) {
+      return base;
+    }
+    // Only published versions for current folder; exclude symbolic 'latest'
+    const filtered = base.filter((v) => {
+      const isLatest = String(v || '').toLowerCase() === 'latest';
+      return !isLatest && publishedVersionsForFolder.has(v);
+    });
+    // Ensure currently selected (possibly unreleased) remains visible to allow user to switch away
+    if (terminologyVersion && !filtered.includes(terminologyVersion)) {
+      filtered.push(terminologyVersion);
+    }
+    const seen = new Set();
+    return filtered.filter((v) => (seen.has(v) ? false : (seen.add(v), true)));
+  }, [terminologyVersions, terminologyVersion, showUnreleased, publishedVersionsForFolder]);
 
   const versionLabelText = activeCategory.versionLabel || 'Version';
   const filePanelHeading = hasVersionedSources && terminologyVersion
@@ -2583,7 +2678,8 @@ export default function CSVViewer() {
         setDownloadRowCount(null);
         return;
       }
-      const trimmed = (debouncedFilterTerm || '').trim();
+      const raw = (debouncedFilterTerm || '').trim();
+      const trimmed = raw.length >= 2 ? raw : '';
       const hasFilters = Array.isArray(workerFilters) && workerFilters.length > 0;
       const client = workerClientRef.current;
       // If no query and no filters, we export the preview rows.
@@ -2623,9 +2719,9 @@ export default function CSVViewer() {
 
   useEffect(() => {
     if (!isSqliteMode || !manifest) return;
-    const trimmed = filterTerm.trim();
+    const trimmed = (debouncedFilterTerm || '').trim();
     const hasFilters = Array.isArray(workerFilters) && workerFilters.length > 0;
-    if (!hasFilters && !trimmed) {
+    if (!hasFilters && (!trimmed || trimmed.length < 2)) {
       // No filters and no query: show preview again
       setSearchStatus('idle');
       setSearchError(null);
@@ -2661,7 +2757,7 @@ export default function CSVViewer() {
         setSearchStatus('error');
         setSearchError(err?.message || 'Search failed');
       });
-  }, [isSqliteMode, manifest, workerFilters, filterTerm, sqlitePreview, headers]);
+  }, [isSqliteMode, manifest, workerFilters, debouncedFilterTerm, sqlitePreview, headers]);
 
   useEffect(() => {
     workerFiltersRef.current = workerFilters;
@@ -2694,7 +2790,9 @@ export default function CSVViewer() {
       if (isSqliteMode && workerClientRef.current && sqlitePreview?.columns?.[colIndex]) {
         const colName = sqlitePreview.columns[colIndex];
         const otherFilters = workerFilters.filter((f) => f.column !== colName);
-        const { promise } = workerClientRef.current.distinct(colName, { limit: 25, query: filterTerm.trim(), filters: otherFilters });
+        // Show distinct values for the column based on other active column filters only.
+        // Do not constrain by the global free-text query to avoid empty dropdowns.
+        const { promise } = workerClientRef.current.distinct(colName, { limit: 25, query: '', filters: otherFilters });
         const data = await promise;
         setDistinctItems(Array.isArray(data.items) ? data.items : []);
       } else {
@@ -3006,11 +3104,19 @@ export default function CSVViewer() {
           gap: '8px',
           maxWidth: '100%'
         }}>
-          <h1 style={{
-            fontSize: '1.5rem',
-            fontWeight: 'bold',
-            margin: 0
-          }}>Tuva Terminology Viewer</h1>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '6px' }}>
+            <img
+              src={`${resolvePublicPath() || ''}/the_tuva_project_logo_new%20(1).png`}
+              alt="Tuva Health"
+              style={{ height: 36, width: 'auto' }}
+              onError={(e) => { try { e.currentTarget.style.display = 'none'; } catch (_) {} }}
+            />
+            <h1 style={{
+              fontSize: '1.5rem',
+              fontWeight: 'bold',
+              margin: 0
+            }}>Tuva Terminology Viewer</h1>
+          </div>
           {sqliteCatalogError && (
             <span style={{ fontSize: '12px', color: '#dc2626' }}>
               Large dataset search is unavailable: {sqliteCatalogError}
@@ -3107,6 +3213,15 @@ export default function CSVViewer() {
                 {versionLoadError}
               </span>
             )}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 12, color: '#4b5563' }}>
+              <input
+                type="checkbox"
+                checked={showUnreleased}
+                onChange={(e) => setShowUnreleased(!!e.target.checked)}
+                style={{ width: 14, height: 14 }}
+              />
+              Include unreleased versions
+            </label>
           </div>
         )}
       </div>
@@ -3185,7 +3300,7 @@ export default function CSVViewer() {
         display: 'flex',
         flexDirection: 'column',
         height: 'calc(100vh - 80px)',
-        marginTop: '48px',
+        marginTop: '96px',
         boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1)',
         overflow: 'hidden'
       }}>
@@ -3301,7 +3416,7 @@ export default function CSVViewer() {
         display: 'flex',
         flexDirection: 'column',
         height: 'calc(100vh - 80px)',
-        marginTop: '48px',
+        marginTop: '96px',
         overflow: 'hidden'
       }}>
         <div style={{
@@ -3513,20 +3628,26 @@ export default function CSVViewer() {
                 position: 'relative',
                 marginBottom: isSqliteMode ? '8px' : '16px'
               }}>
-                <input
-                  type="text"
-                  placeholder={filterInputPlaceholder}
-                  style={{
-                    width: '100%',
-                    padding: '8px 8px 8px 32px',
-                    border: '1px solid #d1d5db',
-                    borderRadius: '6px',
-                    fontSize: '14px'
-                  }}
-                  value={filterTerm}
-                  onChange={(e) => setFilterTerm(e.target.value)}
-                  disabled={filterInputDisabled}
-                />
+          <input
+            type="text"
+            placeholder={filterInputPlaceholder}
+            style={{
+              width: '100%',
+              padding: '8px 8px 8px 32px',
+              border: '1px solid #d1d5db',
+              borderRadius: '6px',
+              fontSize: '14px'
+            }}
+            value={filterTerm}
+            onChange={(e) => setFilterTerm(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && isSqliteMode && manifest) {
+                // Allow forcing a 1-character search on Enter
+                executeSqliteSearch((filterTerm || '').trim());
+              }
+            }}
+            disabled={filterInputDisabled}
+          />
                 <Search style={{
                   position: 'absolute',
                   left: '8px',
@@ -3575,6 +3696,26 @@ export default function CSVViewer() {
                   {latestConcreteVersion && (
                     <div style={{ marginTop: 4, color: '#92400e' }}>
                       Index covers version: {latestConcreteVersion}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {versionedFolders.has(currentFileFolder) && isUnreleasedSelection && (
+                <div style={{
+                  marginTop: '4px',
+                  marginBottom: '8px',
+                  fontSize: '12px',
+                  color: '#b45309',
+                  backgroundColor: '#fffbeb',
+                  border: '1px solid #f59e0b',
+                  borderRadius: '6px',
+                  padding: '8px'
+                }}>
+                  You are viewing an unpublished version. Files here may change until the next GitHub release.
+                  {publishedLatestVersion && (
+                    <div style={{ marginTop: 4, color: '#92400e' }}>
+                      Latest published version: {publishedLatestVersion}
                     </div>
                   )}
                 </div>
@@ -3976,3 +4117,6 @@ export default function CSVViewer() {
     </div>
   )
 }
+
+// Named export for unit testing of dataset id derivation
+export { deriveDatasetId };

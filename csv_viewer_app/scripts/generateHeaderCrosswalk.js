@@ -206,6 +206,30 @@ const readSeedHeaders = (tag, seedRelativePath) => {
   return null;
 };
 
+function versionComparePrepare(value = '') {
+  return String(value || '').replace(/_/g, '.');
+}
+
+function compareVersions(a = '', b = '') {
+  const aParts = versionComparePrepare(a).split(/[^0-9A-Za-z]+/).filter(Boolean);
+  const bParts = versionComparePrepare(b).split(/[^0-9A-Za-z]+/).filter(Boolean);
+  const maxLen = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < maxLen; i += 1) {
+    const as = aParts[i] || '0';
+    const bs = bParts[i] || '0';
+    const an = Number(as);
+    const bn = Number(bs);
+    const aIsNum = Number.isFinite(an);
+    const bIsNum = Number.isFinite(bn);
+    if (aIsNum && bIsNum) {
+      if (an !== bn) return an > bn ? 1 : -1;
+    } else if (as !== bs) {
+      return as > bs ? 1 : -1;
+    }
+  }
+  return 0;
+}
+
 const buildCrosswalk = (tags) => {
   const crosswalk = {};
   const meta = {
@@ -214,6 +238,8 @@ const buildCrosswalk = (tags) => {
     repoDir,
     tagsProcessed: [],
     tagsWithErrors: [],
+    latestPerFolder: {},
+    latestVersion: null,
   };
 
   tags.forEach((tag) => {
@@ -291,6 +317,30 @@ const buildCrosswalk = (tags) => {
       meta.tagsWithErrors.push({ tag, entries: versionErrors });
     }
   });
+
+  // Compute latest per folder and global latest from discovered versions
+  try {
+    const folders = Object.keys(crosswalk);
+    const allVersions = new Set();
+    folders.forEach((folder) => {
+      const versions = Object.keys(crosswalk[folder] || {});
+      if (versions.length) {
+        const sorted = versions
+          .filter((v) => String(v).toLowerCase() !== 'latest')
+          .sort((a, b) => compareVersions(versionComparePrepare(b), versionComparePrepare(a)));
+        if (sorted[0]) {
+          meta.latestPerFolder[folder] = sorted[0];
+          sorted.forEach((v) => allVersions.add(v));
+        }
+      }
+    });
+    // Global latest as the max across folders
+    const unionSorted = Array.from(allVersions)
+      .sort((a, b) => compareVersions(versionComparePrepare(b), versionComparePrepare(a)));
+    meta.latestVersion = unionSorted[0] || null;
+  } catch (e) {
+    warn(`Failed to compute latest versions: ${e.message}`);
+  }
 
   return { crosswalk, meta };
 };

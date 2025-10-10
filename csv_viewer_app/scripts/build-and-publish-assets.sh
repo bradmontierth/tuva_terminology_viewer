@@ -79,9 +79,23 @@ REPO_ROOT="${APP_DIR}"
 # 1) Optionally sync CSV inputs from source bucket to local data/
 if [[ $DO_SYNC_INPUTS -eq 1 ]]; then
   IFS=',' read -r -a VER_LIST <<< "$VERSIONS"
+  # Resolve 'latest' to latest published tag when crosswalk exists or can be generated
+  PUBLISHED_LATEST=""
+  if [[ -f "public/data/header-crosswalk.json" ]]; then
+    PUBLISHED_LATEST=$(node -e 'try{const f=require("./public/data/header-crosswalk.json");console.log((f._meta&&f._meta.latestVersion)||"");}catch(e){console.log("");}')
+  else
+    echo "Generating header crosswalk to resolve published latest..."
+    npm run generate:crosswalk || true
+    if [[ -f "public/data/header-crosswalk.json" ]]; then
+      PUBLISHED_LATEST=$(node -e 'try{const f=require("./public/data/header-crosswalk.json");console.log((f._meta&&f._meta.latestVersion)||"");}catch(e){console.log("");}')
+    fi
+  fi
   for VER in "${VER_LIST[@]}"; do
     VER_TRIMMED="${VER//[[:space:]]/}"
     if [[ -z "$VER_TRIMMED" ]]; then continue; fi
+    if [[ "$VER_TRIMMED" == "latest" && -n "$PUBLISHED_LATEST" ]]; then
+      VER_TRIMMED="$PUBLISHED_LATEST"
+    fi
     echo "Syncing inputs for version: $VER_TRIMMED"
     aws "${AWS_PROFILE_ARG[@]}" "${AWS_REGION_ARG[@]}" s3 sync \
       "s3://${SRC_BUCKET}/versioned_terminology/${VER_TRIMMED}/" \
@@ -118,10 +132,18 @@ fi
 
 # 4) Build SQLite bundles for all requested versions
 if [[ $DO_SQLITE -eq 1 ]]; then
+  # Resolve 'latest' to the latest published tag from header-crosswalk, if available
+  PUBLISHED_LATEST=""
+  if [[ -f "public/data/header-crosswalk.json" ]]; then
+    PUBLISHED_LATEST=$(node -e 'try{const f=require("./public/data/header-crosswalk.json");console.log((f._meta&&f._meta.latestVersion)||"");}catch(e){console.log("");}')
+  fi
   IFS=',' read -r -a VER_LIST <<< "$VERSIONS"
   for VER in "${VER_LIST[@]}"; do
     VER_TRIMMED="${VER//[[:space:]]/}"
     if [[ -z "$VER_TRIMMED" ]]; then continue; fi
+    if [[ "$VER_TRIMMED" == "latest" && -n "$PUBLISHED_LATEST" ]]; then
+      VER_TRIMMED="$PUBLISHED_LATEST"
+    fi
     echo "Building SQLite bundles for version: $VER_TRIMMED"
     npm run build:sqlite:batch -- \
       "${REPO_ROOT}/../data/versioned_terminology/${VER_TRIMMED}" \
@@ -163,4 +185,3 @@ fi
 
 popd >/dev/null
 echo "Done."
-

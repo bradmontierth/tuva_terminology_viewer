@@ -59,6 +59,25 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="Keep temporary files created for multi-part datasets",
     )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        help="Force shard count for all builds (e.g., 1 for API use)",
+    )
+    parser.add_argument(
+        "--max-shard-bytes",
+        type=int,
+        help="Override max shard size in bytes",
+    )
+    parser.add_argument(
+        "--skip-preview",
+        action="store_true",
+        help="Do not emit preview.json for each dataset",
+    )
+    parser.add_argument(
+        "--crosswalk",
+        help="Header crosswalk JSON override passed to build-sqlite.js",
+    )
     return parser.parse_args(argv)
 
 
@@ -78,13 +97,32 @@ def iter_source_files(path: Path) -> Iterator[Path]:
 
 
 def dataset_key_for(path: Path) -> Tuple[str, Path]:
+    """Return a stable dataset id from a source file path.
+
+    Handles these patterns:
+      - provider.csv_0_2_1.csv.gz   -> provider
+      - provider_compressed.csv.gz  -> provider
+      - other_provider_taxonomy.csv.gz -> other_provider_taxonomy
+    """
     name = path.name
     without_gz = name[:-3] if name.endswith(".gz") else name
-    if ".csv" not in without_gz:
-        base = without_gz
+
+    # Prefer matching chunked naming: <base>.csv_<parts>.csv
+    # Example: provider.csv_0_2_1.csv
+    m = None
+    import re as _re
+    m = _re.match(r"^(?P<base>.+?)\.csv(?:_[0-9]+(?:_[0-9]+)*)?\.csv$", without_gz)
+    if m:
+        base = m.group("base")
+    elif without_gz.endswith(".csv"):
+        base = without_gz[:-4]
     else:
-        base = without_gz.split(".csv", 1)[0]
-    # Dataset id is everything before the first ".csv" marker
+        base = without_gz
+
+    # Normalise trailing _compressed
+    if base.endswith("_compressed"):
+        base = base[: -len("_compressed")]
+
     dataset_id = base
     return dataset_id, path
 
@@ -147,6 +185,14 @@ def build_sqlite(dataset_id: str, input_path: Path, args: argparse.Namespace) ->
         command.extend(["--output", args.output])
     if args.label_prefix:
         command.extend(["--label", f"{args.label_prefix}{dataset_id}"])
+    if args.shard_count:
+        command.extend(["--shard-count", str(int(args.shard_count))])
+    if args.max_shard_bytes:
+        command.extend(["--max-shard-bytes", str(int(args.max_shard_bytes))])
+    if args.skip_preview:
+        command.append("--skip-preview")
+    if args.crosswalk:
+        command.extend(["--crosswalk", args.crosswalk])
     if args.dry_run:
         print("DRY RUN:", shlex.join(command))
         return
@@ -170,9 +216,16 @@ def main(argv: Sequence[str]) -> int:
         return 0
 
     for dataset_id, paths in sorted(grouped.items()):
-        if dataset_id.endswith("_compressed"):
-            print(f"Skipping {dataset_id}: marked as compressed duplicate.")
-            continue
+        # If both a master compressed copy and chunked files exist for this dataset,
+        # prefer the master compressed file as the build input.
+        def is_master_compressed(p: Path) -> bool:
+            n = p.name.lower()
+            return n.endswith("_compressed.csv.gz") or n.endswith("_compressed.csv")
+
+        master_candidates = [p for p in paths if is_master_compressed(p)]
+        if master_candidates:
+            # Use the first master copy; ignore chunks
+            paths = [sorted(master_candidates)[0]]
         if dataset_filter and dataset_id.lower() not in dataset_filter:
             continue
 

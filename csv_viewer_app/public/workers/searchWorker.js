@@ -560,11 +560,9 @@ async function handleSearchMessage(payload) {
     }
   }
 
-  // For exact numeric IDs (e.g., a 10-digit NPI), cap limit to 1
-  // so we stop scanning shards immediately after the first hit.
-  const effectiveLimit = isExactNumericQuery(normalized)
-    ? Math.min(1, Number.isFinite(limit) ? Number(limit) : MAX_RESULTS)
-    : (Number.isFinite(limit) ? Number(limit) : MAX_RESULTS);
+  // Respect the requested limit for all queries, including exact numeric IDs
+  // (e.g., NPI). Many NPIs appear multiple times; do not force a cap of 1.
+  const effectiveLimit = (Number.isFinite(limit) ? Number(limit) : MAX_RESULTS);
 
   // Include tokens from filters (for routing) when present
   const filterTokens = new Set();

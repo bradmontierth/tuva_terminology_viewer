@@ -254,10 +254,20 @@ function loadLimits(limitsPath, repoRoot) {
     ? path.resolve(limitsPath)
     : path.join(repoRoot, 'src', 'config', 'limits.json');
   try {
-    // eslint-disable-next-line global-require, import/no-dynamic-require
-    return require(resolved);
+    if (fs.existsSync(resolved)) {
+      // eslint-disable-next-line global-require, import/no-dynamic-require
+      return require(resolved);
+    }
+    // If no explicit --limits was provided and the default file is missing,
+    // treat as no limits without warning.
+    if (limitsPath) {
+      console.warn(`Warning: unable to load limits from ${resolved}: file not found`);
+    }
   } catch (error) {
-    console.warn(`Warning: unable to load limits from ${resolved}: ${error.message}`);
+    // Only warn if the user explicitly provided a path; otherwise stay quiet.
+    if (limitsPath) {
+      console.warn(`Warning: unable to load limits from ${resolved}: ${error.message}`);
+    }
   }
   return {};
 }

@@ -1,0 +1,53 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Tuva Terminology Viewer - Search API (SQLite on S3)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 180
+    MemorySize: 3072
+    Architectures: [x86_64]
+    EphemeralStorage:
+      Size: 4096
+    Environment:
+      Variables:
+        S3_BUCKET: !Ref SqliteBucket
+        S3_PREFIX: api_sqlite
+        CORS_ALLOW_ORIGIN: '*'
+
+Parameters:
+  SqliteBucket:
+    Type: String
+    Description: S3 bucket name that stores <dataset>.sqlite files
+
+Resources:
+  SearchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: handler.handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SqliteBucket
+      Events:
+        ApiSearch:
+          Type: HttpApi
+          Properties:
+            Path: /search
+            Method: GET
+        ApiCount:
+          Type: HttpApi
+          Properties:
+            Path: /count
+            Method: GET
+        ApiDistinct:
+          Type: HttpApi
+          Properties:
+            Path: /distinct
+            Method: GET
+
+Outputs:
+  ApiUrl:
+    Description: HTTP API endpoint URL
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"

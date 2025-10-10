@@ -18,6 +18,10 @@ datasets render with friendly column names.
   and `npm test`. To skip a refresh you can set `TUVA_CROSSWALK_SKIP_FETCH=1`
   (reuse the existing clone) or `TUVA_CROSSWALK_DISABLE=1` (skip the step
   entirely).
+- `_meta.latestVersion` and `_meta.latestPerFolder` are included in
+  `header-crosswalk.json` and used by the app/scripts to prefer the latest
+  published Git tag rather than the S3 `latest` alias (which may contain
+  unreleased changes).
 - Set `TUVA_REPO_URL`, `TUVA_REPO_DIR`, or `TUVA_CROSSWALK_OUTPUT` to override
   the default source repository, cache location, or output file.
 - When working without network access, generate the crosswalk once manually (or
@@ -48,6 +52,8 @@ scripts.
   dataset whose row-count exceeds the preview threshold. Files ending in
   `_compressed` are skipped automatically because they duplicate the canonical
   exports.
+  - When passing `latest`, helper scripts resolve it to the most recent
+    published Git tag from the header crosswalk, avoiding S3's dev `latest`.
 - `npm run sync:sqlite-assets -- <sources...>` syncs the published bundle set
   down from S3 (`s3://tuva-public-resources/terminology_viewer_sqlite` by
   default), runs the batch builder, and pushes refreshed artefacts back to the
@@ -76,6 +82,24 @@ scripts.
   Example (force remote on localhost):
 
   `REACT_APP_USE_S3_PROXY=true REACT_APP_SQLITE_SOURCE=remote npm start`
+
+- `REACT_APP_SEARCH_BACKEND` toggles the large-dataset search implementation:
+  - `worker` – default; in-browser sql.js/httpvfs reading `.sqlite` from S3
+  - `api` – use the serverless Search API (see `search_api/`) via HTTP
+  - unset – defaults to `worker`
+
+- `REACT_APP_SEARCH_API_BASE_URL` base URL for the Search API when
+  `REACT_APP_SEARCH_BACKEND=api` (e.g., `https://xxxx.execute-api.us-east-1.amazonaws.com/Prod`).
+  If unset, the app calls the same origin (`/search`, `/count`, `/distinct`).
+
+- `REACT_APP_DEV_API_PROXY` (dev only) if set, the CRA dev server proxies
+  `/search`, `/count`, `/distinct` to this target (e.g., `http://127.0.0.1:8000`).
+  This avoids CORS while testing a local API.
+
+### Version selection defaults
+- The viewer defaults to the latest published Git tag (from the crosswalk) not the S3 `latest` alias.
+- The version dropdown shows only published versions by default; users can check
+  “Include unreleased versions” to reveal dev versions (including S3 `latest`).
 
 - `REACT_APP_USE_S3_PROXY` toggles the dev proxy used for S3 object listings on
   localhost. Set to `true` to route `GET /s3-proxy/?list-type=2...` to the S3
