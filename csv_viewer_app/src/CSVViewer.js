@@ -2504,15 +2504,59 @@ export default function CSVViewer() {
     setActiveCategoryId(categoryId);
   };
 
+  // Build a map of group.id -> { raw, normalized } column names for the current version
+  const groupColumnsMap = useMemo(() => {
+    const map = new Map();
+    if (!Array.isArray(fileGroups) || !fileGroups.length) {
+      return map;
+    }
+    for (const group of fileGroups) {
+      try {
+        const entry = resolveCrosswalkEntry(group.folder, terminologyVersion, group.csvName);
+        const cols = (entry && Array.isArray(entry.headers)) ? entry.headers : [];
+        const normalized = cols
+          .map((h) => String(h || '').trim().toLowerCase())
+          .filter(Boolean);
+        map.set(group.id, { raw: cols, normalized });
+      } catch (_) {
+        map.set(group.id, { raw: [], normalized: [] });
+      }
+    }
+    return map;
+  }, [fileGroups, terminologyVersion, headerCrosswalk]);
+
   const normalizedSearch = searchTerm.trim().toLowerCase();
   const filteredGroups = fileGroups.filter((group) => {
     if (!normalizedSearch) {
       return true;
     }
 
+    // Match on display name, base csv name, file segment names
     const haystack = [group.displayName, group.csvName, ...group.files].join(' ').toLowerCase();
-    return haystack.includes(normalizedSearch);
+    if (haystack.includes(normalizedSearch)) {
+      return true;
+    }
+
+    // Also match on column names via the crosswalk for the current version
+    const colsEntry = groupColumnsMap.get(group.id) || { normalized: [] };
+    const cols = Array.isArray(colsEntry.normalized) ? colsEntry.normalized : [];
+    return cols.some((c) => c.includes(normalizedSearch));
   });
+
+  // For UI: which columns matched the query per group (original casing)
+  const groupColumnMatches = useMemo(() => {
+    const map = new Map();
+    if (!normalizedSearch) return map;
+    for (const group of fileGroups) {
+      const entry = groupColumnsMap.get(group.id) || { raw: [], normalized: [] };
+      const raw = Array.isArray(entry.raw) ? entry.raw : [];
+      const matches = raw.filter((h) => String(h || '').toLowerCase().includes(normalizedSearch));
+      if (matches.length) {
+        map.set(group.id, matches);
+      }
+    }
+    return map;
+  }, [fileGroups, groupColumnsMap, normalizedSearch]);
 
   const selectedGroup = fileGroups.find((group) => group.id === selectedGroupId) || null;
 
@@ -3316,7 +3360,7 @@ export default function CSVViewer() {
         }}>
           <input
             type="text"
-            placeholder="Search files..."
+            placeholder="Search files and columns..."
             style={{
               width: '100%',
               padding: '8px 8px 8px 32px',
@@ -3396,6 +3440,23 @@ export default function CSVViewer() {
                     {group.folder === provider_folder ? ' · Provider data' : ''}
                     {group.files.length > 1 ? ' · ' + group.files.length + ' files' : ''}
                   </span>
+                  {normalizedSearch && (groupColumnMatches.get(group.id)?.length > 0) && (
+                    <span style={{
+                      fontSize: '12px',
+                      color: '#6b7280',
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      marginTop: 2
+                    }}>
+                      Columns: {(() => {
+                        const cols = groupColumnMatches.get(group.id) || [];
+                        const preview = cols.slice(0, 2).join(', ');
+                        const extra = cols.length > 2 ? `, +${cols.length - 2} more` : '';
+                        return preview + extra;
+                      })()}
+                    </span>
+                  )}
                 </div>
               </div>
             ))
