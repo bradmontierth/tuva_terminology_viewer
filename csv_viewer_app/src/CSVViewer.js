@@ -493,6 +493,22 @@ export default function CSVViewer() {
     if (!terminologyVersion) {
       return true;
     }
+    // Prefer manifest-embedded identity when available (records the exact source version)
+    if (manifest && manifest.sourceIdentity && manifest.sourceIdentity.signature && identityCrosswalk) {
+      const folder = manifest.sourceIdentity.folder || currentFileFolder;
+      const baseCsv = (manifest.sourceIdentity.baseCsv || normalizeBaseCsv(currentFileName)).toLowerCase();
+      const folderEntry = identityCrosswalk[folder];
+      const group = folderEntry && folderEntry.groups && folderEntry.groups[baseCsv];
+      if (!group) {
+        return true; // be permissive if identity info missing
+      }
+      const effectiveVersion = isLatest(terminologyVersion) ? (latestConcreteVersion || terminologyVersion) : terminologyVersion;
+      const selectedEntry = (Array.isArray(group.history) ? group.history : []).find((h) => h && h.version === effectiveVersion);
+      if (!selectedEntry || !selectedEntry.signature) {
+        return true;
+      }
+      return selectedEntry.signature === manifest.sourceIdentity.signature;
+    }
     if (isLatest(terminologyVersion)) {
       return true;
     }
@@ -521,7 +537,14 @@ export default function CSVViewer() {
       }
     }
     return true;
-  }, [sqliteEntry, versionedFolders, currentFileFolder, terminologyVersion, identityCrosswalk, currentFileName, latestConcreteVersion]);
+  }, [sqliteEntry, versionedFolders, currentFileFolder, terminologyVersion, identityCrosswalk, currentFileName, latestConcreteVersion, manifest]);
+
+  const indexCoversVersion = useMemo(() => {
+    if (manifest && manifest.sourceIdentity && manifest.sourceIdentity.version) {
+      return manifest.sourceIdentity.version;
+    }
+    return latestConcreteVersion;
+  }, [manifest, latestConcreteVersion]);
 
   const initializeWorker = useCallback(async (manifestPayload, manifestHref) => {
     if (!manifestPayload || !manifestHref) {
@@ -3754,9 +3777,9 @@ export default function CSVViewer() {
                   padding: '8px'
                 }}>
                   This version differs from the indexed content. Full-text search is disabled for historical versions. To search values beyond the preview, switch to the most recent version.
-                  {latestConcreteVersion && (
+                  {indexCoversVersion && (
                     <div style={{ marginTop: 4, color: '#92400e' }}>
-                      Index covers version: {latestConcreteVersion}
+                      Index covers version: {indexCoversVersion}
                     </div>
                   )}
                 </div>

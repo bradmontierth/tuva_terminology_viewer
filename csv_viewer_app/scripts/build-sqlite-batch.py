@@ -78,6 +78,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--crosswalk",
         help="Header crosswalk JSON override passed to build-sqlite.js",
     )
+    parser.add_argument(
+        "--identity-json",
+        help="Identity crosswalk JSON passed to build-sqlite.js (default: public/data/file-identity-crosswalk.json if present)",
+    )
     return parser.parse_args(argv)
 
 
@@ -193,6 +197,26 @@ def build_sqlite(dataset_id: str, input_path: Path, args: argparse.Namespace) ->
         command.append("--skip-preview")
     if args.crosswalk:
         command.extend(["--crosswalk", args.crosswalk])
+    # Attach identity metadata when available to embed source signature
+    identity_path = args.identity_json
+    if not identity_path:
+        default_identity = repo_root / "public" / "data" / "file-identity-crosswalk.json"
+        if default_identity.exists():
+            identity_path = str(default_identity)
+    if identity_path:
+        command.extend(["--identity-json", identity_path])
+    # Derive source folder/version from the input path if possible
+    try:
+        parts = [p for p in input_path.resolve().parts]
+        for i, part in enumerate(parts):
+            if part in ("versioned_terminology", "versioned_provider_data", "versioned_value_sets"):
+                folder = part
+                version = parts[i + 1] if i + 1 < len(parts) else None
+                if version:
+                    command.extend(["--source-folder", folder, "--source-version", version])
+                break
+    except Exception:
+        pass
     if args.dry_run:
         print("DRY RUN:", shlex.join(command))
         return

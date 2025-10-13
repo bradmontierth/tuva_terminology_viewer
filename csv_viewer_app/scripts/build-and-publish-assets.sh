@@ -138,6 +138,11 @@ if [[ $DO_SQLITE -eq 1 ]]; then
     PUBLISHED_LATEST=$(node -e 'try{const f=require("./public/data/header-crosswalk.json");console.log((f._meta&&f._meta.latestVersion)||"");}catch(e){console.log("");}')
   fi
   IFS=',' read -r -a VER_LIST <<< "$VERSIONS"
+  # If identity file exists, pass it through to embed sourceIdentity in manifests
+  IDENTITY_JSON=""
+  if [[ -f "public/data/file-identity-crosswalk.json" ]]; then
+    IDENTITY_JSON="public/data/file-identity-crosswalk.json"
+  fi
   for VER in "${VER_LIST[@]}"; do
     VER_TRIMMED="${VER//[[:space:]]/}"
     if [[ -z "$VER_TRIMMED" ]]; then continue; fi
@@ -145,10 +150,18 @@ if [[ $DO_SQLITE -eq 1 ]]; then
       VER_TRIMMED="$PUBLISHED_LATEST"
     fi
     echo "Building SQLite bundles for version: $VER_TRIMMED"
-    npm run build:sqlite:batch -- \
+    if [[ -n "$IDENTITY_JSON" ]]; then
+      npm run build:sqlite:batch -- \
+        --identity-json "$IDENTITY_JSON" \
+        "${REPO_ROOT}/../data/versioned_terminology/${VER_TRIMMED}" \
+        "${REPO_ROOT}/../data/versioned_value_sets/${VER_TRIMMED}" \
+        "${REPO_ROOT}/../data/versioned_provider_data/${VER_TRIMMED}" || true
+    else
+      npm run build:sqlite:batch -- \
       "${REPO_ROOT}/../data/versioned_terminology/${VER_TRIMMED}" \
       "${REPO_ROOT}/../data/versioned_value_sets/${VER_TRIMMED}" \
       "${REPO_ROOT}/../data/versioned_provider_data/${VER_TRIMMED}" || true
+    fi
   done
 fi
 

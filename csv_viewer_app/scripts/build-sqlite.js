@@ -50,6 +50,67 @@ function loadCrosswalk(crosswalkPath, repoRoot) {
   return null;
 }
 
+function loadIdentityCrosswalk(identityPath, repoRoot) {
+  const resolved = identityPath
+    ? path.resolve(identityPath)
+    : path.join(repoRoot, 'public', 'data', 'file-identity-crosswalk.json');
+  try {
+    return loadJsonFile(resolved);
+  } catch (error) {
+    // Be quiet if default path is missing; warn only when explicitly provided
+    if (identityPath) {
+      console.warn(`Warning: unable to load identity crosswalk from ${resolved}: ${error.message}`);
+    }
+  }
+  return null;
+}
+
+function toBaseCsvNameForInput(fileName, datasetId) {
+  if (fileName) {
+    let normalized = String(fileName).trim();
+    // Normalize master compressed filenames to base dataset names
+    normalized = normalized
+      .replace(/_compressed\.csv\.gz$/i, '.csv.gz')
+      .replace(/_compressed\.csv$/i, '.csv');
+    const m = normalized.match(/^(.*?\.csv)(?:_[0-9]+(?:_[0-9]+)*)?\.csv\.gz$/i);
+    if (m) return m[1].toLowerCase();
+    if (/\.csv\.gz$/i.test(normalized)) {
+      return normalized.replace(/\.csv\.gz$/i, '.csv').toLowerCase();
+    }
+    if (/\.csv$/i.test(normalized)) {
+      return normalized.toLowerCase();
+    }
+  }
+  return `${String(datasetId || '').toLowerCase()}.csv`;
+}
+
+function resolveSourceIdentity(identity, folder, version, datasetId, inputPath) {
+  if (!identity || !folder || !version) {
+    return null;
+  }
+  const folderEntry = identity[folder];
+  if (!folderEntry || !folderEntry.groups) {
+    return null;
+  }
+  const baseName = toBaseCsvNameForInput(path.basename(inputPath), datasetId);
+  const group = folderEntry.groups[baseName];
+  if (!group || !Array.isArray(group.history)) {
+    return null;
+  }
+  const entry = group.history.find((h) => h && h.version === version);
+  if (!entry || !entry.signature) {
+    return null;
+  }
+  return {
+    folder,
+    version,
+    baseCsv: baseName,
+    signature: entry.signature,
+    segments: Array.isArray(entry.segments) ? entry.segments : undefined,
+    baseUrl: identity?._meta?.baseUrl || undefined,
+  };
+}
+
 function resolveCrosswalkHeaders(crosswalk, datasetId, inputPath) {
   if (!crosswalk) {
     return null;
@@ -157,6 +218,9 @@ Options:
   --output <dir>            Output directory (default: public/data/sqlite)
   --limits <path>           limits.json path (default: src/config/limits.json)
   --crosswalk <path>        header crosswalk JSON path (default: public/data/header-crosswalk.json)
+  --identity-json <path>    identity crosswalk JSON path (default: public/data/file-identity-crosswalk.json)
+  --source-folder <name>    source folder key (e.g., versioned_terminology)
+  --source-version <ver>    source version (e.g., 0.15.2)
   --shard-count <n>         Explicit shard count override
   --max-shard-bytes <n>     Target max uncompressed bytes per shard (default 125829120)
   --shard-key <cols>        Comma separated column names used for shard hashing
@@ -174,6 +238,9 @@ function parseArgs(argv) {
     output: null,
     limitsPath: null,
     crosswalkPath: null,
+    identityPath: null,
+    sourceFolder: null,
+    sourceVersion: null,
     shardCount: null,
     maxShardBytes: DEFAULT_MAX_SHARD_BYTES,
     shardKey: [],
@@ -199,6 +266,15 @@ function parseArgs(argv) {
         break;
       case '--crosswalk':
         options.crosswalkPath = argv[++i];
+        break;
+      case '--identity-json':
+        options.identityPath = argv[++i];
+        break;
+      case '--source-folder':
+        options.sourceFolder = argv[++i];
+        break;
+      case '--source-version':
+        options.sourceVersion = argv[++i];
         break;
       case '--shard-count':
         options.shardCount = Number.parseInt(argv[++i], 10);
@@ -750,6 +826,20 @@ async function main() {
       maxShardBytes: args.maxShardBytes,
     },
   };
+
+  // Optionally embed source identity (folder/version/signature) to align UI warnings
+  const identity = loadIdentityCrosswalk(args.identityPath, repoRoot);
+  const srcId = resolveSourceIdentity(identity, args.sourceFolder, args.sourceVersion, datasetId, inputPath);
+  if (srcId) {
+    manifest.sourceIdentity = srcId;
+  } else if (args.sourceFolder || args.sourceVersion) {
+    // Record minimal hint if provided but no signature found
+    manifest.sourceIdentity = {
+      folder: args.sourceFolder || undefined,
+      version: args.sourceVersion || undefined,
+      baseCsv: toBaseCsvNameForInput(path.basename(inputPath), datasetId),
+    };
+  }
 
   const manifestPath = path.join(datasetDir, 'manifest.json');
   await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2));
