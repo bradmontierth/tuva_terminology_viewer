@@ -46,11 +46,75 @@ export default class SearchApiClient {
   async _fetchJson(path, params) {
     const url = buildUrl(this.apiBase, path, params);
     const res = await fetch(url, { credentials: 'omit' });
+    const contentType = res.headers.get('content-type') || '';
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new Error(`API ${res.status}: ${text || res.statusText}`);
     }
+    // Be defensive: some misconfigurations return HTML (index.html) with 200 OK
+    if (!contentType.toLowerCase().includes('json')) {
+      const text = await res.text().catch(() => '');
+      if (/^\s*</.test(text || '')) {
+        throw new Error(
+          'Received non-JSON (likely HTML) from API. Check REACT_APP_SEARCH_API_BASE_URL or CloudFront routing for /search, /count, /distinct.'
+        );
+      }
+      try {
+        return JSON.parse(text);
+      } catch (_) {
+        throw new Error('API returned a non-JSON payload.');
+      }
+    }
     return res.json();
+  }
+
+  /**
+   * Fetch all result items for the current dataset/query/filters by paging the API.
+   * Respects the server page cap (500) and an optional totalLimit.
+   * Returns { total, items } where items is a flat array of objects.
+   */
+  async exportAll(query, { filters, totalLimit, onProgress } = {}) {
+    const dataset = this.datasetId;
+    if (!dataset) {
+      throw new Error('Dataset not initialised');
+    }
+    // Determine total via /count first
+    const countUrl = buildUrl(this.apiBase, '/count', {
+      dataset,
+      query: query || '',
+      filters: Array.isArray(filters) && filters.length ? JSON.stringify(filters) : undefined,
+    });
+    const countRes = await fetch(countUrl, { credentials: 'omit' });
+    if (!countRes.ok) {
+      const txt = await countRes.text().catch(() => '');
+      throw new Error(`API ${countRes.status}: ${txt || countRes.statusText}`);
+    }
+    const countJson = await countRes.json();
+    const total = typeof countJson.total === 'number' ? countJson.total : 0;
+    const target = typeof totalLimit === 'number' && totalLimit > 0 ? Math.min(totalLimit, total) : total;
+    const items = [];
+    const PAGE = 500; // server-enforced upper bound
+    let offset = 0;
+    while (offset < target) {
+      const limit = Math.min(PAGE, target - offset);
+      const data = await this._fetchJson('/search', {
+        dataset,
+        query: query || '',
+        limit,
+        offset,
+        filters: Array.isArray(filters) && filters.length ? JSON.stringify(filters) : undefined,
+      });
+      const pageItems = Array.isArray(data.items) ? data.items : [];
+      if (pageItems.length === 0) break;
+      items.push(...pageItems);
+      offset += pageItems.length;
+      if (typeof onProgress === 'function') {
+        try { onProgress({ fetched: offset, total: target || total }); } catch (_) { /* noop */ }
+      }
+      // Safety: if server returns fewer than requested but not zero, still continue until we reach target
+      if (pageItems.length < limit && offset >= total) break;
+    }
+    return { total, items };
   }
 
   search(query, { onUpdate, limit, offset = 0, filters } = {}) {

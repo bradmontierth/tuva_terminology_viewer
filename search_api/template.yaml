@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Tuva Terminology Viewer - Search API (SQLite on S3)
+Description: Tuva Terminology Viewer - Search API (SQLite on EFS/S3)
 
 Globals:
   Function:
@@ -13,13 +13,43 @@ Globals:
     Environment:
       Variables:
         S3_BUCKET: !Ref SqliteBucket
-        S3_PREFIX: api_sqlite
-        CORS_ALLOW_ORIGIN: '*'
+        S3_PREFIX: !Ref S3Prefix
+        CORS_ALLOW_ORIGIN: !Ref CorsAllowOrigin
+        EFS_SQLITE_DIR: !Ref EfsSqliteDir
 
 Parameters:
   SqliteBucket:
     Type: String
     Description: S3 bucket name that stores <dataset>.sqlite files
+  S3Prefix:
+    Type: String
+    Default: api_sqlite
+    Description: S3 prefix for <dataset>.sqlite files
+  CorsAllowOrigin:
+    Type: String
+    Default: '*'
+    Description: CORS allow origin for API responses
+  EfsAccessPointArn:
+    Type: String
+    Description: ARN of an existing EFS Access Point to mount
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Description: Private subnet IDs for Lambda VPC config
+  VpcSecurityGroupIds:
+    Type: CommaDelimitedList
+    Description: Security group IDs for Lambda VPC config
+  ProvisionedConcurrency:
+    Type: Number
+    Default: 1
+    Description: Provisioned concurrency for the function alias
+  EfsMountPath:
+    Type: String
+    Default: /mnt/efs
+    Description: Local mount path for EFS
+  EfsSqliteDir:
+    Type: String
+    Default: /mnt/efs
+    Description: Directory on EFS containing <dataset>.sqlite files
 
 Resources:
   SearchFunction:
@@ -27,9 +57,20 @@ Resources:
     Properties:
       CodeUri: .
       Handler: handler.handler
+      AutoPublishAlias: live
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrentExecutions: !Ref ProvisionedConcurrency
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref SqliteBucket
+        - AWSLambdaVPCAccessExecutionRole
+        - AWSLambdaBasicExecutionRole
+      VpcConfig:
+        SubnetIds: !Ref VpcSubnetIds
+        SecurityGroupIds: !Ref VpcSecurityGroupIds
+      FileSystemConfigs:
+        - Arn: !Ref EfsAccessPointArn
+          LocalMountPath: !Ref EfsMountPath
       Events:
         ApiSearch:
           Type: HttpApi
@@ -46,6 +87,24 @@ Resources:
           Properties:
             Path: /distinct
             Method: GET
+
+  EfsSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: efs_sync.handler
+      Timeout: 900
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SqliteBucket
+        - AWSLambdaVPCAccessExecutionRole
+        - AWSLambdaBasicExecutionRole
+      VpcConfig:
+        SubnetIds: !Ref VpcSubnetIds
+        SecurityGroupIds: !Ref VpcSecurityGroupIds
+      FileSystemConfigs:
+        - Arn: !Ref EfsAccessPointArn
+          LocalMountPath: !Ref EfsMountPath
 
 Outputs:
   ApiUrl:

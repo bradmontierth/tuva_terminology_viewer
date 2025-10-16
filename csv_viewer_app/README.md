@@ -1,9 +1,7 @@
-# Tuva Terminology Viewer
+# Frontend (CSV Viewer)
 
-The CSV viewer is responsible for presenting Tuva's public terminology exports.
-In addition to the standard Create React App scripts, the project includes
-helpers for generating the header crosswalk JSON and the SQLite bundles that
-power the streaming search experience in production.
+React SPA used in production with the serverless Search API.
+For deploy and ops, see docs/DEPLOYMENT.md and docs/ENVIRONMENT.md.
 
 ## Header Crosswalk
 
@@ -84,13 +82,21 @@ scripts.
   `REACT_APP_USE_S3_PROXY=true REACT_APP_SQLITE_SOURCE=remote npm start`
 
 - `REACT_APP_SEARCH_BACKEND` toggles the large-dataset search implementation:
-  - `worker` – default; in-browser sql.js/httpvfs reading `.sqlite` from S3
-  - `api` – use the serverless Search API (see `search_api/`) via HTTP
-  - unset – defaults to `worker`
+  - `api` – use the serverless Search API (see `search_api/`) via HTTP (default)
+  - `worker` – in-browser sql.js/httpvfs reading `.sqlite` from S3
+  - unset – defaults to `api`
 
 - `REACT_APP_SEARCH_API_BASE_URL` base URL for the Search API when
   `REACT_APP_SEARCH_BACKEND=api` (e.g., `https://xxxx.execute-api.us-east-1.amazonaws.com/Prod`).
   If unset, the app calls the same origin (`/search`, `/count`, `/distinct`).
+
+  Production note: if you do not configure CloudFront to route
+  `/search`, `/count`, and `/distinct` to your API Gateway origin, leaving this
+  unset will cause those paths to hit the SPA index.html and return HTML with
+  `200 OK`. In that case the UI will show an error like:
+  `Unexpected token '<' ... is not valid JSON`. Fix by either:
+  - Setting `REACT_APP_SEARCH_API_BASE_URL` to the API Gateway URL when building, or
+  - Adding CloudFront behaviors for `/search*`, `/count*`, `/distinct*` pointing to the API origin.
 
 - `REACT_APP_DEV_API_PROXY` (dev only) if set, the CRA dev server proxies
   `/search`, `/count`, `/distinct` to this target (e.g., `http://127.0.0.1:8000`).

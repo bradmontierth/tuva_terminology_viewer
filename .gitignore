@@ -1,3 +1,17 @@
 package-lock.json
 data/
 .aws-sam/
+scripts/outputs/*
+!scripts/outputs/.gitkeep
+.DS_Store
+
+# Search API deploy salt (generated during build to force new versions)
+search_api/.build_salt.txt
+
+# Frontend generated data
+csv_viewer_app/public/data/file-identity-crosswalk.json
+csv_viewer_app/public/data/sqlite/
+
+# Optional local envs at repo root
+.env.local
+.env.*.local

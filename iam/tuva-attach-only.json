@@ -1,0 +1,34 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadForContext",
+      "Effect": "Allow",
+      "Action": [
+        "iam:ListPolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AttachSpecificPoliciesToRole",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::__ACCOUNT_ID__:role/__ROLE_NAME__",
+      "Condition": {
+        "StringEquals": {
+          "iam:PolicyARN": [
+            "arn:aws:iam::__ACCOUNT_ID__:policy/__NAME_PREFIX__-setup-efs-datasync",
+            "arn:aws:iam::__ACCOUNT_ID__:policy/__NAME_PREFIX__-sam-deploy"
+          ]
+        }
+      }
+    }
+  ]
+}
+

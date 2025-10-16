@@ -4,7 +4,9 @@ set -euo pipefail
 # Simple helper to build the CSV viewer and deploy to an S3 bucket.
 #
 # Usage:
-#   ./scripts/deploy-to-s3.sh [bucket-name] [--no-build] [--profile NAME] [--region REGION] [--website] [--cf-dist-id ID] [--include-sqlite]
+#   ./scripts/deploy-to-s3.sh [bucket-name] \
+#     [--prefix terminology-viewer] [--no-build] [--profile NAME] [--region REGION] \
+#     [--website] [--cf-dist-id ID] [--include-sqlite]
 #
 # Defaults:
 #   bucket-name = tuva-terminology-viewer
@@ -25,9 +27,14 @@ AWS_REGION_ARG=()
 ENABLE_WEBSITE=0
 CF_DIST_ID=""
 INCLUDE_SQLITE=0
+DEST_PREFIX=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --prefix)
+      DEST_PREFIX="$2"
+      shift 2
+      ;;
     --no-build)
       DO_BUILD=0
       shift
@@ -73,8 +80,14 @@ if [[ $DO_BUILD -eq 1 ]]; then
   npm run build
 fi
 
-echo "Syncing build/ (excluding HTML and data prefixes) to s3://${BUCKET}/ (SQLite: $([[ $INCLUDE_SQLITE -eq 1 ]] && echo include || echo exclude))"
-# Never touch dataset prefixes in the root bucket when deploying the app.
+echo "Syncing build/ (excluding HTML and data prefixes) to s3://${BUCKET}${DEST_PREFIX:+/$DEST_PREFIX}/ (SQLite: $([[ $INCLUDE_SQLITE -eq 1 ]] && echo include || echo exclude))"
+# Destination base (optionally under a prefix)
+DEST_BASE="s3://${BUCKET}"
+if [[ -n "$DEST_PREFIX" ]]; then
+  DEST_BASE="s3://${BUCKET}/${DEST_PREFIX%/}"
+fi
+
+# Never touch dataset or API prefixes when deploying the app.
 # This avoids deleting large data trees that are not part of the app build.
 SYNC_EXCLUDES=(
   --exclude "*.html"
@@ -83,23 +96,57 @@ SYNC_EXCLUDES=(
   --exclude "versioned_provider_data/*"
   --exclude "reference-data/*"
   --exclude "terminology_viewer_sqlite/*"
+  --exclude "api_sqlite/*"
 )
 # Optionally exclude local SQLite bundles in the app build unless explicitly requested.
 if [[ $INCLUDE_SQLITE -ne 1 ]]; then
   SYNC_EXCLUDES+=(--exclude "data/sqlite/*")
 fi
+SYNC_DELETE_ARGS=(--delete)
+if [[ -n "$DEST_PREFIX" ]]; then
+  # Be safe when deploying under a shared prefix (preserve sibling trees like api_sqlite)
+  SYNC_DELETE_ARGS=()
+fi
 aws "${AWS_PROFILE_ARG[@]}" "${AWS_REGION_ARG[@]}" s3 sync \
-  "${APP_DIR}/build/" "s3://${BUCKET}/" \
-  --delete --size-only "${SYNC_EXCLUDES[@]}"
+  "${APP_DIR}/build/" "${DEST_BASE}/" \
+  "${SYNC_DELETE_ARGS[@]}" --size-only "${SYNC_EXCLUDES[@]}"
 
 # Upload HTML from local build explicitly to avoid size-only false negatives
-echo "Uploading HTML (with cache headers) from local build to s3://${BUCKET}/"
+echo "Uploading HTML (with cache headers) from local build to ${DEST_BASE}/"
 aws "${AWS_PROFILE_ARG[@]}" "${AWS_REGION_ARG[@]}" s3 cp \
-  "${APP_DIR}/build/" "s3://${BUCKET}/" \
+  "${APP_DIR}/build/" "${DEST_BASE}/" \
   --recursive --exclude "*" --include "*.html" \
   --metadata-directive REPLACE \
   --cache-control "max-age=0, s-maxage=0, no-cache, no-store, must-revalidate" \
   --content-type "text/html"
+
+# Verify that all assets referenced by asset-manifest.json exist in S3
+if command -v jq >/dev/null 2>&1; then
+  MANIFEST_PATH="${APP_DIR}/build/asset-manifest.json"
+  if [[ -f "$MANIFEST_PATH" ]]; then
+    echo "Verifying uploaded assets listed in asset-manifest.json exist in S3..."
+    # Collect unique list of files: entrypoints + files values
+    mapfile -t MANIFEST_FILES < <(jq -r '[.entrypoints[]] + (.files | to_entries | map(.value)) | unique[]' "$MANIFEST_PATH")
+    MISSING=()
+    for rel in "${MANIFEST_FILES[@]}"; do
+      # strip leading ./ if present
+      key="${rel#./}"
+      # prepend prefix if provided
+      if [[ -n "$DEST_PREFIX" ]]; then
+        key="${DEST_PREFIX%/}/$key"
+      fi
+      if ! aws "${AWS_PROFILE_ARG[@]}" "${AWS_REGION_ARG[@]}" s3api head-object --bucket "$BUCKET" --key "$key" >/dev/null 2>&1; then
+        MISSING+=("$key")
+      fi
+    done
+    if [[ ${#MISSING[@]} -gt 0 ]]; then
+      echo "ERROR: The following manifest assets are missing in s3://$BUCKET/:" >&2
+      for k in "${MISSING[@]}"; do echo " - $k" >&2; done
+      echo "Deployment incomplete. Please rerun or investigate upload permissions." >&2
+      exit 1
+    fi
+  fi
+fi
 
 # Note: HTML already uploaded with metadata above
 

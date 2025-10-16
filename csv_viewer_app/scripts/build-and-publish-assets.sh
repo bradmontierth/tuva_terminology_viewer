@@ -12,7 +12,9 @@ set -euo pipefail
 #     [--versions latest,0.15.3] \
 #     [--profile NAME] [--region REGION] \
 #     [--identity-base-url https://tuva-public-resources.s3.amazonaws.com] \
+#     [--prefix terminology-viewer] \
 #     [--skip-input-sync] [--skip-crosswalk] [--skip-identity] [--skip-sqlite] \
+#     [--single-shard]
 #     [--cf-dist-id DIST_ID]
 #
 # Notes:
@@ -31,10 +33,13 @@ AWS_PROFILE_ARG=()
 AWS_REGION_ARG=()
 CF_DIST_ID=""
 IDENTITY_BASE_URL=""
+PREFIX=""
 DO_SYNC_INPUTS=1
 DO_CROSSWALK=1
 DO_IDENTITY=1
 DO_SQLITE=1
+FORCE_SINGLE_SHARD=1
+SKIP_SHARDS=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +57,10 @@ while [[ $# -gt 0 ]]; do
       CF_DIST_ID="$2"; shift 2 ;;
     --identity-base-url)
       IDENTITY_BASE_URL="$2"; shift 2 ;;
+    --prefix)
+      PREFIX="$2"; shift 2 ;;
+    --skip-shards)
+      SKIP_SHARDS=1; shift 1 ;;
     --skip-input-sync)
       DO_SYNC_INPUTS=0; shift 1 ;;
     --skip-crosswalk)
@@ -60,6 +69,8 @@ while [[ $# -gt 0 ]]; do
       DO_IDENTITY=0; shift 1 ;;
     --skip-sqlite)
       DO_SQLITE=0; shift 1 ;;
+    --single-shard)
+      FORCE_SINGLE_SHARD=1; shift 1 ;;
     *)
       echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
@@ -149,27 +160,33 @@ if [[ $DO_SQLITE -eq 1 ]]; then
     if [[ "$VER_TRIMMED" == "latest" && -n "$PUBLISHED_LATEST" ]]; then
       VER_TRIMMED="$PUBLISHED_LATEST"
     fi
-    echo "Building SQLite bundles for version: $VER_TRIMMED"
+    echo "Building SQLite bundles for version: $VER_TRIMMED"$([[ $FORCE_SINGLE_SHARD -eq 1 ]] && echo " (single-shard)")
     if [[ -n "$IDENTITY_JSON" ]]; then
       npm run build:sqlite:batch -- \
+        $([[ $FORCE_SINGLE_SHARD -eq 1 ]] && echo "--shard-count 1") \
         --identity-json "$IDENTITY_JSON" \
         "${REPO_ROOT}/../data/versioned_terminology/${VER_TRIMMED}" \
         "${REPO_ROOT}/../data/versioned_value_sets/${VER_TRIMMED}" \
         "${REPO_ROOT}/../data/versioned_provider_data/${VER_TRIMMED}" || true
     else
       npm run build:sqlite:batch -- \
-      "${REPO_ROOT}/../data/versioned_terminology/${VER_TRIMMED}" \
-      "${REPO_ROOT}/../data/versioned_value_sets/${VER_TRIMMED}" \
-      "${REPO_ROOT}/../data/versioned_provider_data/${VER_TRIMMED}" || true
+        $([[ $FORCE_SINGLE_SHARD -eq 1 ]] && echo "--shard-count 1") \
+        "${REPO_ROOT}/../data/versioned_terminology/${VER_TRIMMED}" \
+        "${REPO_ROOT}/../data/versioned_value_sets/${VER_TRIMMED}" \
+        "${REPO_ROOT}/../data/versioned_provider_data/${VER_TRIMMED}" || true
     fi
   done
 fi
 
 # 5) Publish crosswalks and SQLite bundles to destination bucket
-echo "Publishing assets to s3://${DEST_BUCKET} ..."
+DEST_BASE="s3://${DEST_BUCKET}"
+if [[ -n "$PREFIX" ]]; then
+  DEST_BASE="s3://${DEST_BUCKET}/${PREFIX%/}"
+fi
+echo "Publishing assets to ${DEST_BASE} ..."
 aws "${AWS_PROFILE_ARG[@]}" "${AWS_REGION_ARG[@]}" s3 cp \
   "public/data/header-crosswalk.json" \
-  "s3://${DEST_BUCKET}/data/header-crosswalk.json" \
+  "${DEST_BASE}/data/header-crosswalk.json" \
   --metadata-directive REPLACE \
   --cache-control "max-age=0, s-maxage=0, no-cache, no-store, must-revalidate" \
   --content-type "application/json"
@@ -177,23 +194,29 @@ aws "${AWS_PROFILE_ARG[@]}" "${AWS_REGION_ARG[@]}" s3 cp \
 if [[ -f "public/data/file-identity-crosswalk.json" ]]; then
   aws "${AWS_PROFILE_ARG[@]}" "${AWS_REGION_ARG[@]}" s3 cp \
     "public/data/file-identity-crosswalk.json" \
-    "s3://${DEST_BUCKET}/data/file-identity-crosswalk.json" \
+    "${DEST_BASE}/data/file-identity-crosswalk.json" \
     --metadata-directive REPLACE \
     --cache-control "max-age=0, s-maxage=0, no-cache, no-store, must-revalidate" \
     --content-type "application/json"
 fi
 
+SQLITE_SYNC_EXCLUDES=()
+if [[ $SKIP_SHARDS -eq 1 ]]; then
+  SQLITE_SYNC_EXCLUDES=(--exclude "*.sqlite" --exclude "*.routing.json")
+fi
 aws "${AWS_PROFILE_ARG[@]}" "${AWS_REGION_ARG[@]}" s3 sync \
   "public/data/sqlite/" \
-  "s3://${DEST_BUCKET}/data/sqlite/" \
-  --delete --size-only
+  "${DEST_BASE}/data/sqlite/" \
+  --delete --size-only "${SQLITE_SYNC_EXCLUDES[@]}"
 
 # 6) Optional CloudFront invalidation
 if [[ -n "$CF_DIST_ID" ]]; then
   echo "Creating CloudFront invalidation for distribution $CF_DIST_ID"
+  PREF=""
+  if [[ -n "$PREFIX" ]]; then PREF="/${PREFIX%/}"; fi
   aws "${AWS_PROFILE_ARG[@]}" cloudfront create-invalidation \
     --distribution-id "$CF_DIST_ID" \
-    --paths "/data/header-crosswalk.json" "/data/sqlite/datasets.json" "/data/sqlite/*"
+    --paths "${PREF}/data/header-crosswalk.json" "${PREF}/data/sqlite/datasets.json" "${PREF}/data/sqlite/*"
 fi
 
 popd >/dev/null

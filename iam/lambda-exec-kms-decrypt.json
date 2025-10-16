@@ -1,0 +1,12 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "KmsDecryptForS3",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt", "kms:DescribeKey"],
+      "Resource": "arn:aws:kms:__REGION__:__ACCOUNT_ID__:key/__KMS_KEY_ID__"
+    }
+  ]
+}
+

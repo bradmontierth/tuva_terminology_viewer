@@ -1,0 +1,98 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Ec2Networking",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeAvailabilityZones",
+        "ec2:DescribeSecurityGroups",
+        "ec2:CreateSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:CreateTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Ec2CreateNIPermForDataSync",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkInterfacePermission"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {"ec2:AuthorizedService": "datasync.amazonaws.com"},
+        "ArnLike": {"ec2:Subnet": "arn:aws:ec2:*:*:subnet/*"}
+      }
+    },
+    {
+      "Sid": "IamCreateServiceLinkedRoleForDataSync",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "*",
+      "Condition": {"StringEquals": {"iam:AWSServiceName": "datasync.amazonaws.com"}}
+    },
+    {
+      "Sid": "EfsProvision",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:CreateFileSystem",
+        "elasticfilesystem:CreateMountTarget",
+        "elasticfilesystem:CreateAccessPoint",
+        "elasticfilesystem:DescribeFileSystems",
+        "elasticfilesystem:DescribeMountTargets",
+        "elasticfilesystem:DescribeMountTargetSecurityGroups",
+        "elasticfilesystem:DescribeAccessPoints",
+        "elasticfilesystem:TagResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IamCreateServiceLinkedRoleForEFS",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "*",
+      "Condition": {"StringEquals": {"iam:AWSServiceName": "elasticfilesystem.amazonaws.com"}}
+    },
+    {
+      "Sid": "DataSyncProvision",
+      "Effect": "Allow",
+      "Action": [
+        "datasync:CreateLocationEfs",
+        "datasync:CreateLocationS3",
+        "datasync:CreateTask",
+        "datasync:StartTaskExecution",
+        "datasync:DescribeTask",
+        "datasync:DescribeTaskExecution",
+        "datasync:ListTasks",
+        "datasync:TagResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IamForDataSyncS3Role",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:PutRolePolicy",
+        "iam:GetRole",
+        "iam:PassRole"
+      ],
+      "Resource": "arn:aws:iam::__ACCOUNT_ID__:role/__NAME_PREFIX__-datasync-s3-role"
+    },
+    {
+      "Sid": "S3ListGetForOps",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListAllMyBuckets",
+        "s3:GetBucketLocation",
+        "s3:ListBucket",
+        "s3:GetObject"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

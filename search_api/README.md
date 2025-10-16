@@ -51,6 +51,11 @@ Deploy (AWS SAM minimal)
    - sam deploy --guided
 2) After deploy, note the API endpoint URL.
 
+Production (Make targets)
+- From repo root you can deploy/update the API and sync EFS with pre-wired params:
+  - `make deploy-api PROFILE=<aws-profile> STACK=TuvaSearchApi BUCKET=<assets-bucket> PREFIX=terminology-viewer/api_sqlite ORIGIN=https://<your-domain>`
+  - `make deploy-efs-sync PROFILE=<aws-profile> BUCKET=<assets-bucket> PREFIX=terminology-viewer/api_sqlite ORIGIN=https://<your-domain>`
+
 Front-end wiring
 - In `csv_viewer_app` build, set:
   - REACT_APP_SEARCH_BACKEND=api

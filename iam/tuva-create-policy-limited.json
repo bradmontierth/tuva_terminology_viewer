@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCreatePolicyWithTag",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicy"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {"aws:RequestTag/Project": "__NAME_PREFIX__"},
+        "ForAllValues:StringEquals": {"aws:TagKeys": ["Project"]}
+      }
+    },
+    {
+      "Sid": "AllowListGetPolicies",
+      "Effect": "Allow",
+      "Action": [
+        "iam:ListPolicies",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+

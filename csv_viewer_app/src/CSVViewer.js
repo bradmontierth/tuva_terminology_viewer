@@ -552,7 +552,7 @@ export default function CSVViewer() {
     }
 
     if (!workerClientRef.current) {
-      const backend = (process.env.REACT_APP_SEARCH_BACKEND || '').trim().toLowerCase();
+      const backend = (process.env.REACT_APP_SEARCH_BACKEND || 'api').trim().toLowerCase();
       if (backend === 'api') {
         // Lazy load to avoid bundling when unused
         const mod = await import('./lib/SearchApiClient');
@@ -1269,9 +1269,11 @@ export default function CSVViewer() {
     const sourceMode = getSqliteSourceMode();
     if (sourceMode === 'remote') {
       const remoteBase = (process.env.REACT_APP_DATA_BASE_URL || DEFAULT_BASE_DOMAIN).replace(/\/$/, '');
-      // Prefer standard app layout first (data/sqlite) for our bucket
+      // Prefer standard app layout first (data/sqlite) for our bucket root
       addCandidate(remoteBase);
-      // Also try the legacy public layout for compatibility
+      // Also try explicit site prefix layout used in public-resources
+      addCandidate(`${remoteBase}/terminology-viewer`);
+      // Legacy fallback for older public layout
       addCandidate(`${remoteBase}/terminology_viewer_sqlite/datasets.json`);
     }
 
@@ -3042,18 +3044,28 @@ export default function CSVViewer() {
       }
 
       setExportingAll(true);
-      const { promise } = client.search(trimmed, { limit: SQLITE_EXPORT_LIMIT, filters: activeFilters });
-      const data = await promise;
+      let items = [];
+      if (typeof client.exportAll === 'function') {
+        // API backend: page through all results up to export limit
+        const result = await client.exportAll(trimmed, { filters: activeFilters, totalLimit: SQLITE_EXPORT_LIMIT });
+        items = Array.isArray(result?.items) ? result.items : [];
+      } else {
+        // Worker backend: request a large limit in one go
+        const { promise } = client.search(trimmed, { limit: SQLITE_EXPORT_LIMIT, filters: activeFilters });
+        const data = await promise;
+        items = Array.isArray(data?.items) ? data.items : [];
+      }
+
       const baseColumns = sqlitePreview.columns.length
         ? sqlitePreview.columns
         : (Array.isArray(manifest?.narrowColumns) ? manifest.narrowColumns : []);
       const effectiveColumns = baseColumns.length
         ? baseColumns
-        : (Array.isArray(data.items) && data.items.length
-          ? Object.keys(data.items[0]).filter((k) => k !== 'rowid')
+        : (Array.isArray(items) && items.length
+          ? Object.keys(items[0]).filter((k) => k !== 'rowid')
           : []);
-      const rows = Array.isArray(data.items)
-        ? data.items.map((item) => effectiveColumns.map((column) => item?.[column] ?? null))
+      const rows = Array.isArray(items)
+        ? items.map((item) => effectiveColumns.map((column) => item?.[column] ?? null))
         : [];
       const sortedRows = sortRowsIfNeeded(rows);
       const csvString = Papa.unparse({ fields: headers, data: sortedRows });
@@ -3070,7 +3082,7 @@ export default function CSVViewer() {
       document.body.removeChild(link);
       setTimeout(() => URL.revokeObjectURL(url), 1000);
 
-      if (Array.isArray(data.items) && data.items.length >= SQLITE_EXPORT_LIMIT) {
+      if (Array.isArray(items) && items.length >= SQLITE_EXPORT_LIMIT) {
         try { alert(`Downloaded first ${SQLITE_EXPORT_LIMIT.toLocaleString()} rows. Refine filters to reduce size.`); } catch (_) { /* ignore */ }
       }
     } catch (e) {

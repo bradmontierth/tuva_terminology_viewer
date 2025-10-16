@@ -1,0 +1,18 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCreateGroup",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup"],
+      "Resource": "arn:aws:logs:us-east-1:696836267384:log-group:/aws/datasync/tuva-tv"
+    },
+    {
+      "Sid": "AllowWriteStreams",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:us-east-1:696836267384:log-group:/aws/datasync/tuva-tv:log-stream:*"
+    }
+  ]
+}
+

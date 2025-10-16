@@ -13,6 +13,8 @@
 /scripts/.cache
 /src/generated
 /public/data/header-crosswalk.json
+/public/data/file-identity-crosswalk.json
+/public/data/sqlite/
 
 # misc
 .DS_Store

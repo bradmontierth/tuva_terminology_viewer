@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 S3_PREFIX = os.environ.get("S3_PREFIX", "api_sqlite").strip("/")
 LOCAL_SQLITE_DIR = os.environ.get("LOCAL_SQLITE_DIR", "")
+EFS_SQLITE_DIR = os.environ.get("EFS_SQLITE_DIR", "")
 ALLOWED_DATASETS = {
     d.strip().lower() for d in os.environ.get("ALLOWED_DATASETS", "").split(",") if d.strip()
 }
@@ -60,6 +61,11 @@ def _ensure_db_path(dataset: str) -> str:
     local_dir = "/tmp/tuva_sqlite"
     os.makedirs(local_dir, exist_ok=True)
     local_path = os.path.join(local_dir, f"{safe}.sqlite")
+    # Prefer EFS mount if available (read-only datasets)
+    if EFS_SQLITE_DIR:
+        efs_candidate = os.path.join(EFS_SQLITE_DIR, f"{safe}.sqlite")
+        if os.path.exists(efs_candidate) and os.path.getsize(efs_candidate) > 0:
+            return efs_candidate
     # Dev mode: use local sqlite directory if provided
     if LOCAL_SQLITE_DIR:
         # support both: <dir>/<dataset>.sqlite and <dir>/<dataset>/<dataset>.sqlite
@@ -88,10 +94,17 @@ def _open_db(dataset: str) -> sqlite3.Connection:
         if key in _db_cache:
             return _db_cache[key]
         path = _ensure_db_path(key)
-        conn = sqlite3.connect(path, check_same_thread=False)
+        # Open read-only and immutable for best performance over EFS
+        try:
+            uri = f"file:{os.path.abspath(path)}?mode=ro&immutable=1"
+            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        except Exception:
+            # Fallback to normal open if URI fails for some reason
+            conn = sqlite3.connect(path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         # Pragmas for read performance
         try:
+            conn.execute("PRAGMA query_only=ON;")
             conn.execute("PRAGMA journal_mode=OFF;")
             conn.execute("PRAGMA synchronous=OFF;")
             conn.execute("PRAGMA temp_store=MEMORY;")
@@ -332,19 +345,63 @@ def _distinct(conn: sqlite3.Connection, dataset: str, column: str, limit: int, q
     }
 
 
-def _bad_request(msg: str, code: int = 400) -> Dict[str, Any]:
-    return _response({"error": msg}, status=code)
+def _parse_allowed_origins(cfg: str) -> List[str]:
+    vals = [o.strip() for o in (cfg or "").split(",")]
+    return [v for v in vals if v]
 
 
-def _response(body: Dict[str, Any], status: int = 200) -> Dict[str, Any]:
+def _cors_origin_for_event(event: Dict[str, Any]) -> Tuple[str, bool]:
+    # Returns (origin_value, vary)
+    cfg = CORS_ALLOW_ORIGIN or ""
+    if cfg == "*":
+        return "*", False
+    allowed = set(_parse_allowed_origins(cfg))
+    # Extract request Origin header (case-insensitive)
+    headers = event.get("headers") or {}
+    req_origin = None
+    if isinstance(headers, dict):
+        # API Gateway may lower-case header keys
+        for k in ("origin", "Origin"):  # quick check first
+            if k in headers and isinstance(headers[k], str):
+                req_origin = headers[k]
+                break
+        if req_origin is None:
+            # fallback: find any key case-insensitively
+            for k, v in headers.items():
+                if str(k).lower() == "origin" and isinstance(v, str):
+                    req_origin = v
+                    break
+    if req_origin and req_origin in allowed:
+        return req_origin, True
+    # No match: return first configured to be safe; browsers will block if mismatched
+    first = next(iter(allowed), "*")
+    return (first, True if first != "*" else False)
+
+
+def _bad_request(msg: str, code: int = 400, event: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return _response({"error": msg}, status=code, event=event)
+
+
+def _response(body: Dict[str, Any], status: int = 200, event: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    origin = CORS_ALLOW_ORIGIN
+    vary = False
+    if event is not None:
+        try:
+            origin, vary = _cors_origin_for_event(event)
+        except Exception:
+            origin = CORS_ALLOW_ORIGIN
+            vary = False
+    headers = {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET,OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    }
+    if vary:
+        headers["Vary"] = "Origin"
     return {
         "statusCode": status,
-        "headers": {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": CORS_ALLOW_ORIGIN,
-            "Access-Control-Allow-Methods": "GET,OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        },
+        "headers": headers,
         "body": json.dumps(body),
     }
 
@@ -365,19 +422,19 @@ def _get_qs(event: Dict[str, Any]) -> Dict[str, str]:
 
 def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
     if event.get("httpMethod") == "OPTIONS":
-        return _response({"ok": True})
+        return _response({"ok": True}, event=event)
 
     path = _get_path(event).rstrip("/")
     qs = _get_qs(event)
 
     dataset = (qs.get("dataset") or "").strip()
     if not _allowed_dataset(dataset):
-        return _bad_request("Invalid or disallowed dataset")
+        return _bad_request("Invalid or disallowed dataset", event=event)
 
     try:
         conn = _open_db(dataset)
     except Exception as e:
-        return _bad_request(f"Failed to open dataset: {e}")
+        return _bad_request(f"Failed to open dataset: {e}", event=event)
 
     try:
         if path.endswith("/search"):
@@ -386,27 +443,27 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
             offset = max(0, int(qs.get("offset") or 0))
             filters = _parse_filters(qs.get("filters"))
             payload = _search(conn, dataset, q, limit, offset, filters)
-            return _response(payload)
+            return _response(payload, event=event)
         elif path.endswith("/count"):
             q = qs.get("query") or ""
             filters = _parse_filters(qs.get("filters"))
             payload = _count(conn, dataset, q, filters)
-            return _response(payload)
+            return _response(payload, event=event)
         elif path.endswith("/distinct"):
             column = qs.get("column") or ""
             if not column:
-                return _bad_request("Missing column")
+                return _bad_request("Missing column", event=event)
             q = qs.get("query") or ""
             limit = max(1, min(int(qs.get("limit") or 25), 200))
             filters = _parse_filters(qs.get("filters"))
             payload = _distinct(conn, dataset, column, limit, q, filters)
-            return _response(payload)
+            return _response(payload, event=event)
         else:
-            return _bad_request("Unknown path", 404)
+            return _bad_request("Unknown path", 404, event=event)
     except ValueError as ve:
-        return _bad_request(str(ve))
+        return _bad_request(str(ve), event=event)
     except Exception as e:
-        return _response({"error": str(e)}, status=500)
+        return _response({"error": str(e)}, status=500, event=event)
 
 
 # Local quick test (optional)
