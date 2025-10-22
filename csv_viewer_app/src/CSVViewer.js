@@ -385,6 +385,20 @@ export default function CSVViewer() {
   const [sqliteCatalogVersion, setSqliteCatalogVersion] = useState(0);
   const [sqliteCatalogReady, setSqliteCatalogReady] = useState(false);
   const [sqlitePreview, setSqlitePreview] = useState({ columns: [], rows: [], generatedAt: null });
+  const [segmentsExpanded, setSegmentsExpanded] = useState(false);
+  const preferredCsvNameRef = useRef(null);
+  // When selecting a result from another tab, we stash the target to
+  // preselect once that tab's file listing loads.
+  const pendingSelectionRef = useRef(null);
+  // Cache file groups for categories other than the active one, so we can
+  // search across tabs without re-listing every keystroke.
+  // Shape: { [categoryId]: { versionKey, loading, loaded, error, groups: [] } }
+  const [categoryGroupsCache, setCategoryGroupsCache] = useState({});
+  const categoryGroupsCacheRef = useRef({});
+  useEffect(() => { categoryGroupsCacheRef.current = categoryGroupsCache; }, [categoryGroupsCache]);
+  const [showNativeHeader, setShowNativeHeader] = useState(false);
+  const segmentsWrapperRef = useRef(null);
+  const [collapseVisibleCount, setCollapseVisibleCount] = useState(6);
   // Control whether to fetch crosswalk JSONs from network; default prod-only
   const shouldFetchCrosswalks = useMemo(() => {
     const raw = (process.env.REACT_APP_FETCH_CROSSWALKS || '').trim().toLowerCase();
@@ -416,6 +430,12 @@ export default function CSVViewer() {
   const sqliteCatalogRef = useRef(new Map());
   const suppressNextAutoSearchRef = useRef(false);
   const workerFiltersRef = useRef([]);
+
+  // Invalidate cached cross-tab listings when the effective version changes,
+  // since versioned sources depend on it.
+  useEffect(() => {
+    setCategoryGroupsCache({});
+  }, [terminologyVersion]);
 
   const activeCategory = useMemo(
     () => dataCategories.find((category) => category.id === activeCategoryId) || dataCategories[0],
@@ -457,6 +477,8 @@ export default function CSVViewer() {
     }
     return sqliteCatalogRef.current.get(currentDatasetId) || null;
   }, [currentDatasetId, sqliteCatalogVersion]);
+
+  
 
   // Identify the most recent concrete version (excluding symbolic 'latest') for the active folder
   const latestConcreteVersion = useMemo(() => {
@@ -815,7 +837,13 @@ export default function CSVViewer() {
     setSearchError(null);
     setSearchSummary(null);
     setPreviewError(null);
+    setSegmentsExpanded(false);
+    preferredCsvNameRef.current = null;
+    setShowNativeHeader(false);
+    setCollapseVisibleCount(6);
   }, [activeCategory]);
+
+  
 
   useEffect(() => () => {
     if (workerClientRef.current) {
@@ -1242,12 +1270,19 @@ export default function CSVViewer() {
     const candidates = [];
 
     const addCandidate = (value) => {
-      if (!value) {
+      if (!value) return;
+      const raw = String(value).trim();
+      if (!raw) return;
+      // If a full path to datasets.json is provided, use as-is
+      if (/datasets\.json$/i.test(raw)) {
+        const target = raw;
+        if (!seen.has(target)) { seen.add(target); candidates.push(target); }
         return;
       }
-      const normalised = value.replace(/\/+$/, '/');
-      const trimmed = normalised.replace(/\/+data\/sqlite\/datasets\.json$/, '');
-      const target = value.endsWith('datasets.json') ? value : `${normalised}data/sqlite/datasets.json`;
+      // Strip any accidental suffix then ensure a trailing slash before joining
+      const cleaned = raw.replace(/\/+data\/sqlite\/datasets\.json$/i, '');
+      const base = cleaned.endsWith('/') ? cleaned : `${cleaned}/`;
+      const target = `${base}data/sqlite/datasets.json`;
       if (!seen.has(target)) {
         seen.add(target);
         candidates.push(target);
@@ -1269,10 +1304,15 @@ export default function CSVViewer() {
     const sourceMode = getSqliteSourceMode();
     if (sourceMode === 'remote') {
       const remoteBase = (process.env.REACT_APP_DATA_BASE_URL || DEFAULT_BASE_DOMAIN).replace(/\/$/, '');
-      // Prefer standard app layout first (data/sqlite) for our bucket root
-      addCandidate(remoteBase);
-      // Also try explicit site prefix layout used in public-resources
-      addCandidate(`${remoteBase}/terminology-viewer`);
+      const isTuvaPublic = /tuva-public-resources\.s3\.amazonaws\.com$/i.test(remoteBase);
+      // Known Tuva layout lives under /terminology-viewer
+      if (isTuvaPublic) {
+        addCandidate(`${remoteBase}/terminology-viewer`);
+      } else {
+        // For custom buckets, try root first, then optional site prefix
+        addCandidate(remoteBase);
+        addCandidate(`${remoteBase}/terminology-viewer`);
+      }
       // Legacy fallback for older public layout
       addCandidate(`${remoteBase}/terminology_viewer_sqlite/datasets.json`);
     }
@@ -1292,6 +1332,7 @@ export default function CSVViewer() {
       addCandidate(`${origin}/data/sqlite/datasets.json`);
     }
     // Always include a remote fallback at the end to recover when local paths serve HTML.
+    addCandidate('https://tuva-public-resources.s3.amazonaws.com/terminology-viewer/data/sqlite/datasets.json');
     addCandidate('https://tuva-public-resources.s3.amazonaws.com/terminology_viewer_sqlite/datasets.json');
 
     const loadCatalog = async () => {
@@ -1404,7 +1445,7 @@ export default function CSVViewer() {
     }
   }, [getListingBase]);
 
-  const getElementsByTag = (context, tag) => {
+  const getElementsByTag = useCallback((context, tag) => {
     if (!context) {
       return [];
     }
@@ -1447,7 +1488,7 @@ export default function CSVViewer() {
     }
 
     return [];
-  };
+  }, []);
 
   // Fetch the ETag and Size for a single S3 object via a ListObjectsV2 call scoped to the object key.
   // This avoids downloading file content and works with the existing listing proxy.
@@ -1627,7 +1668,7 @@ export default function CSVViewer() {
     return { versionKey: bestKey, map, isFallback: bestKey !== normalizedRequested };
   };
 
-  const resolveCrosswalkEntry = (folder, version, fileName) => {
+  const resolveCrosswalkEntry = useCallback((folder, version, fileName) => {
     if (!headerCrosswalk || typeof headerCrosswalk !== 'object') {
       return null;
     }
@@ -1666,7 +1707,13 @@ export default function CSVViewer() {
     }
 
     return null;
-  };
+  }, [headerCrosswalk, toBaseCsvName]);
+
+  // Crosswalk entry for current selection, to read flags like headersInFile
+  const crosswalkEntryCurrent = useMemo(() => (
+    resolveCrosswalkEntry(currentFileFolder, terminologyVersion, currentFileName)
+  ), [currentFileFolder, terminologyVersion, currentFileName, headerCrosswalk]);
+  const headersInFile = !!(crosswalkEntryCurrent && crosswalkEntryCurrent.headersInFile === true);
 
   const toFriendlyLabel = useCallback((csvName = '') => {
     const base = csvName.replace(/\.csv$/i, '');
@@ -2208,10 +2255,26 @@ export default function CSVViewer() {
           return;
         }
 
-        const firstGroup = groups[0];
-        setSelectedGroupId(firstGroup.id);
-        setCurrentFileName(firstGroup.files[0] || null);
-        setCurrentFileFolder(firstGroup.folder);
+        // Selection priority:
+        // 1) Pending selection from cross-tab search
+        // 2) Keep current dataset (by csvName) when user toggles versions
+        let chosen = null;
+        const pending = pendingSelectionRef.current;
+        if (pending && pending.categoryId === activeCategory.id) {
+          chosen = groups.find((g) => g.csvName === pending.csvName) || null;
+          pendingSelectionRef.current = null;
+        }
+        const preferredCsv = preferredCsvNameRef.current;
+        if (!chosen && userSelectedVersionRef.current && preferredCsv) {
+          chosen = groups.find((g) => g.csvName === preferredCsv) || null;
+        }
+        if (!chosen) {
+          chosen = groups[0];
+        }
+        setSelectedGroupId(chosen.id);
+        setCurrentFileName(chosen.files[0] || null);
+        setCurrentFileFolder(chosen.folder);
+        userSelectedVersionRef.current = false;
       } catch (err) {
         console.error('Failed to load files from S3', err);
         if (isMounted) {
@@ -2430,6 +2493,8 @@ export default function CSVViewer() {
     setCurrentPage(1);
   }, [currentFileUrl, currentFileName, fetchAndProcessCSV, searchMode, currentDatasetId, sqliteCatalogReady, sqliteEntry, sqliteIndexCompatible]);
 
+  // Intentionally do not auto-strip any rows; always show file content as-is.
+
   const handleGroupSelect = (groupId) => {
     const group = fileGroups.find((item) => item.id === groupId);
     if (!group) {
@@ -2443,9 +2508,13 @@ export default function CSVViewer() {
     setColumnFilters({});
     setFilterPopoverOpen(false);
     setFilterDraft({ operator: 'contains', text: '', values: new Set() });
+    setFilterTerm('');
+    setSegmentsExpanded(false);
     const nextFile = group.files[0] || null;
     setCurrentFileName(nextFile);
     setCurrentFileFolder(group.folder);
+    preferredCsvNameRef.current = group.csvName;
+    setShowNativeHeader(false);
   };
 
   const handleFileSegmentSelect = (groupId, fileName) => {
@@ -2465,8 +2534,12 @@ export default function CSVViewer() {
     setColumnFilters({});
     setFilterPopoverOpen(false);
     setFilterDraft({ operator: 'contains', text: '', values: new Set() });
+    setFilterTerm('');
+    setSegmentsExpanded(false);
     setCurrentFileName(fileName);
     setCurrentFileFolder(group.folder);
+    preferredCsvNameRef.current = group.csvName;
+    setShowNativeHeader(false);
   };
 
   const handleVersionChange = (version) => {
@@ -2474,6 +2547,9 @@ export default function CSVViewer() {
       return;
     }
     userSelectedVersionRef.current = true;
+    if (selectedGroup && selectedGroup.csvName) {
+      preferredCsvNameRef.current = selectedGroup.csvName;
+    }
     // Prevent stale auto-search when version changes underneath
     suppressNextAutoSearchRef.current = true;
     setTerminologyVersion(version);
@@ -2481,7 +2557,9 @@ export default function CSVViewer() {
     setColumnFilters({});
     setFilterPopoverOpen(false);
     setFilterDraft({ operator: 'contains', text: '', values: new Set() });
+    setFilterTerm('');
     // The useEffect will automatically trigger and reload the current file with the new version
+    setShowNativeHeader(false);
   };
 
   useEffect(() => {
@@ -2498,7 +2576,17 @@ export default function CSVViewer() {
 
     let nextHeaders = fallbackHeaders;
 
-    if (entry && Array.isArray(entry.headers)) {
+    // Prefer native file header row when dbt specifies headers=true and we are in CSV mode
+    const isSql = searchMode === 'sqlite';
+    const canUseNativeHeader = headersInFile && !isSql && Array.isArray(csvData) && Array.isArray(csvData[0]) && csvData[0].length === columnCount;
+    if (canUseNativeHeader) {
+      const row0 = csvData[0];
+      nextHeaders = row0.map((v, index) => {
+        const raw = v == null ? '' : String(v);
+        const trimmed = raw.trim();
+        return trimmed || fallbackHeaders[index];
+      });
+    } else if (entry && Array.isArray(entry.headers)) {
       if (entry.headers.length !== columnCount) {
         console.warn('Crosswalk headers length mismatch', {
           folder: currentFileFolder,
@@ -2520,7 +2608,7 @@ export default function CSVViewer() {
     }
 
     setHeaders((previous) => (arraysEqual(previous, nextHeaders) ? previous : nextHeaders));
-  }, [columnCount, currentFileFolder, currentFileName, defaultHeaders, headerCrosswalk, terminologyVersion]);
+  }, [columnCount, currentFileFolder, currentFileName, defaultHeaders, headerCrosswalk, terminologyVersion, headersInFile, searchMode, csvData]);
 
   const handleCategoryChange = (categoryId) => {
     if (!categoryId || categoryId === activeCategoryId) {
@@ -2528,6 +2616,165 @@ export default function CSVViewer() {
     }
     setActiveCategoryId(categoryId);
   };
+
+  // Build a stable version key used for caching per-category listings
+  const getCategoryVersionKey = useCallback((category) => {
+    if (!category || !Array.isArray(category.sources)) return '';
+    const hasVersioned = category.sources.some((s) => s && s.type === 'versioned');
+    return hasVersioned ? String(terminologyVersion || '') : '';
+  }, [terminologyVersion]);
+
+  // List files for a given source and current environment, mirroring the
+  // logic in the active-category loader. This avoids refactoring that logic
+  // while enabling cross-tab listings.
+  const listFilesForSource = useCallback(async (source) => {
+    if (!source) return [];
+    const { folder, type, excludedPrefixes: extras = [] } = source;
+    const isVersioned = type === 'versioned';
+    const effectiveVersion = isVersioned ? (terminologyVersion || 'latest') : null;
+
+    const excludedPrefixes = Array.isArray(extras) ? extras.slice() : [];
+    if (isVersioned) {
+      excludedPrefixes.push(`${folder}/latest/`);
+      excludedPrefixes.push(`${folder}/_preview/`);
+      excludedPrefixes.push(`${folder}/_index/`);
+    } else {
+      excludedPrefixes.push(`${folder}/_preview/`);
+      excludedPrefixes.push(`${folder}/_index/`);
+    }
+
+    // Offline mode: try to produce file names from the identity crosswalk
+    if (offlineMode && identityCrosswalk) {
+      try {
+        const folderEntry = identityCrosswalk[folder];
+        const groups = folderEntry && folderEntry.groups ? folderEntry.groups : {};
+        const names = Object.keys(groups);
+        const items = names.map((base) => ({ folder, fileName: `${base.replace(/\.csv$/i, '')}.csv` }));
+        return items.map((i) => i.fileName);
+      } catch (_) {
+        // fall through to network
+      }
+    }
+
+    let listingBase = getListingBase();
+    const prefixBase = isVersioned ? `${folder}/${effectiveVersion}/` : `${folder}/`;
+
+    const files = [];
+    const listForPrefixBase = async (prefixBaseToUse) => {
+      let continuationToken = null;
+      do {
+        const params = new URLSearchParams({ 'list-type': '2', prefix: prefixBaseToUse });
+        if (continuationToken) params.append('continuation-token', continuationToken);
+        const url = buildListingUrl(folder, params.toString(), listingBase);
+        const requestOptions = { cache: 'no-store', headers: { Accept: 'application/xml,text/xml;q=0.9' } };
+        let response = await fetch(url, requestOptions);
+        if (response.status === 304) {
+          response = await fetch(url, { ...requestOptions, cache: 'reload' });
+        }
+        if (!response.ok) {
+          throw new Error(`Failed to list files for ${folder}: ${response.status} ${response.statusText}`);
+        }
+        if (typeof DOMParser === 'undefined') {
+          throw new Error('DOMParser is not available in this environment.');
+        }
+        const xmlText = await response.text();
+        if (!xmlText.trim()) {
+          throw new Error('Received empty file listing response.');
+        }
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('xml') && /^\s*<!doctype\s+html/i.test(xmlText)) {
+          if (listingBase !== baseDomain) {
+            listingBase = baseDomain;
+            setListingBase(baseDomain);
+            continue;
+          }
+          throw new Error('Received HTML instead of XML when listing files.');
+        }
+        const parser = new DOMParser();
+        const xmlDocument = parser.parseFromString(xmlText, 'application/xml');
+        const hasParseError = (
+          xmlDocument.querySelector?.('parsererror') ||
+          xmlDocument.querySelector?.('ParserError') ||
+          getElementsByTag(xmlDocument, 'parsererror')[0] ||
+          getElementsByTag(xmlDocument, 'ParserError')[0]
+        );
+        if (hasParseError) {
+          throw new Error('Unable to parse file listing response.');
+        }
+        const contentsNodes = getElementsByTag(xmlDocument, 'Contents');
+        contentsNodes.forEach((node) => {
+          const keyNode = getElementsByTag(node, 'Key')[0];
+          const keyText = keyNode?.textContent || '';
+          if (!keyText || keyText.endsWith('/')) return;
+          if (excludedPrefixes.some((prefix) => keyText.startsWith(prefix))) return;
+          let relative = keyText;
+          if (relative.startsWith(prefixBaseToUse)) {
+            relative = relative.slice(prefixBaseToUse.length);
+          }
+          relative = relative.trim();
+          if (relative) files.push(relative);
+        });
+        const isTruncated = getElementsByTag(xmlDocument, 'IsTruncated')[0]?.textContent === 'true';
+        continuationToken = isTruncated
+          ? getElementsByTag(xmlDocument, 'NextContinuationToken')[0]?.textContent || null
+          : null;
+      } while (continuationToken);
+    };
+
+    // First attempt: selected/effective version or unversioned root
+    await listForPrefixBase(prefixBase);
+    // Fallback: for versioned sources with no results, try 'latest'
+    if (isVersioned && !files.length && String(effectiveVersion || '').toLowerCase() !== 'latest') {
+      const fallbackPrefix = `${folder}/latest/`;
+      try { await listForPrefixBase(fallbackPrefix); } catch (_) { /* ignore */ }
+    }
+    return files;
+  }, [baseDomain, getListingBase, setListingBase, terminologyVersion, offlineMode, identityCrosswalk, buildListingUrl]);
+
+  // Load all groups for a category and cache them for cross-tab search
+  const loadGroupsForCategory = useCallback(async (category) => {
+    if (!category) return [];
+    const categoryId = category.id;
+    const versionKey = getCategoryVersionKey(category);
+    const existing = categoryGroupsCacheRef.current[categoryId];
+    if (existing && existing.loaded && existing.versionKey === versionKey) {
+      return existing.groups || [];
+    }
+
+    // Mark loading in cache
+    setCategoryGroupsCache((prev) => ({
+      ...prev,
+      [categoryId]: { ...(prev[categoryId] || {}), loading: true, loaded: false, error: null, versionKey, groups: [] },
+    }));
+
+    try {
+      const fileLists = await Promise.all(
+        (category.sources || []).map((source) => {
+          if (source.type === 'versioned' && !terminologyVersion) {
+            return [];
+          }
+          return listFilesForSource(source).catch((_) => []);
+        })
+      );
+
+      const entries = (category.sources || []).flatMap((source, index) =>
+        (fileLists[index] || []).map((fileName) => ({ folder: source.folder, fileName }))
+      );
+      const groups = buildFileGroups(entries);
+
+      setCategoryGroupsCache((prev) => ({
+        ...prev,
+        [categoryId]: { loading: false, loaded: true, error: null, versionKey, groups },
+      }));
+      return groups;
+    } catch (err) {
+      setCategoryGroupsCache((prev) => ({
+        ...prev,
+        [categoryId]: { loading: false, loaded: true, error: err?.message || 'Failed to load', versionKey, groups: [] },
+      }));
+      return [];
+    }
+  }, [buildFileGroups, getCategoryVersionKey, listFilesForSource, terminologyVersion]);
 
   // Build a map of group.id -> { raw, normalized } column names for the current version
   const groupColumnsMap = useMemo(() => {
@@ -2585,6 +2832,100 @@ export default function CSVViewer() {
 
   const selectedGroup = fileGroups.find((group) => group.id === selectedGroupId) || null;
 
+  // Cross-tab search: compute matches in categories other than the active one
+  const otherCategories = useMemo(() => dataCategories.filter((c) => c.id !== activeCategoryId), [dataCategories, activeCategoryId]);
+  const [crossTabMatches, setCrossTabMatches] = useState([]);
+  const [crossTabLoading, setCrossTabLoading] = useState(false);
+  const [crossTabError, setCrossTabError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      setCrossTabError(null);
+      if (!normalizedSearch) {
+        setCrossTabMatches([]);
+        setCrossTabLoading(false);
+        return;
+      }
+      setCrossTabLoading(true);
+      try {
+        // Ensure groups for other categories are available (load on-demand)
+        await Promise.all(otherCategories.map((cat) => loadGroupsForCategory(cat)));
+        if (cancelled) return;
+
+        const allOther = otherCategories.flatMap((cat) => {
+          const cache = categoryGroupsCache[cat.id];
+          const groups = cache && cache.groups ? cache.groups : [];
+          // Filter groups with same criteria as current tab
+          const matches = groups.filter((group) => {
+            const haystack = [group.displayName, group.csvName, ...(group.files || [])].join(' ').toLowerCase();
+            if (haystack.includes(normalizedSearch)) return true;
+            // Also match on crosswalk headers
+            try {
+              const entry = resolveCrosswalkEntry(group.folder, terminologyVersion, group.csvName);
+              const cols = (entry && Array.isArray(entry.headers)) ? entry.headers : [];
+              const normalized = cols.map((h) => String(h || '').trim().toLowerCase()).filter(Boolean);
+              return normalized.some((c) => c.includes(normalizedSearch));
+            } catch (_) {
+              return false;
+            }
+          });
+          return matches.map((g) => ({ categoryId: cat.id, categoryLabel: cat.label, group: g }));
+        });
+        if (!cancelled) setCrossTabMatches(allOther);
+      } catch (err) {
+        if (!cancelled) setCrossTabError(err?.message || 'Cross-tab search failed');
+      } finally {
+        if (!cancelled) setCrossTabLoading(false);
+      }
+    };
+    run();
+    return () => { cancelled = true; };
+  }, [normalizedSearch, otherCategories, loadGroupsForCategory, categoryGroupsCache, resolveCrosswalkEntry, terminologyVersion]);
+
+  const handleCrossTabOpen = useCallback((categoryId, group) => {
+    if (!categoryId || !group) return;
+    // Prevent stale auto-search on dataset switch
+    suppressNextAutoSearchRef.current = true;
+    pendingSelectionRef.current = { categoryId, csvName: group.csvName };
+    preferredCsvNameRef.current = group.csvName;
+    setActiveCategoryId(categoryId);
+  }, []);
+
+  // Recompute how many segment chips fit in one row when collapsed
+  useEffect(() => {
+    if (segmentsExpanded) return; // show-all ignores sizing
+    if (!selectedGroup || !Array.isArray(selectedGroup.files) || !selectedGroup.files.length) {
+      setCollapseVisibleCount(0);
+      return;
+    }
+    const container = segmentsWrapperRef.current;
+    const containerWidth = container ? container.clientWidth : 600;
+    // Reserve space for the Show all button
+    const reserve = 140; // px
+    let budget = Math.max(0, containerWidth - reserve);
+    let count = 0;
+    for (const file of selectedGroup.files) {
+      // Approximate chip width: text(7px avg per char) + padding(24) + gap(8)
+      const chip = Math.min(260, (String(file).length * 7) + 24 + 8);
+      if (chip > budget) break;
+      budget -= chip;
+      count += 1;
+    }
+    setCollapseVisibleCount(Math.max(count, 1));
+  }, [segmentsExpanded, selectedGroupId, selectedGroup]);
+
+  useEffect(() => {
+    const onResize = () => {
+      if (!segmentsExpanded) {
+        // Trigger recompute on next render
+        setCollapseVisibleCount((c) => c);
+      }
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [segmentsExpanded]);
+
   const availableVersions = useMemo(() => {
     const base = terminologyVersions.length
       ? terminologyVersions
@@ -2614,7 +2955,10 @@ export default function CSVViewer() {
   const normalizedFilterTerm = filterTerm.trim().toLowerCase();
 
   const filteredData = useMemo(() => {
-    let base = csvData;
+    const baseRows = (headersInFile && !isSqliteMode && !showNativeHeader && Array.isArray(csvData) && csvData.length)
+      ? csvData.slice(1)
+      : csvData;
+    let base = baseRows;
     if (!isSqliteMode && normalizedFilterTerm) {
       base = base.filter((row) => row.some((cell) => cell && String(cell).toLowerCase().includes(normalizedFilterTerm)));
     }
@@ -2646,7 +2990,7 @@ export default function CSVViewer() {
       });
     }
     return base;
-  }, [csvData, isSqliteMode, normalizedFilterTerm, columnFilters]);
+  }, [csvData, isSqliteMode, normalizedFilterTerm, columnFilters, headersInFile, showNativeHeader]);
 
   const sortedData = useMemo(() => {
     if (sortColumnIndex == null || !Array.isArray(filteredData) || !filteredData.length) {
@@ -3417,18 +3761,11 @@ export default function CSVViewer() {
           }} />
         </div>
 
-        <div style={{
-          overflowY: 'auto',
-          flexGrow: 1
-        }}>
+        <div style={{ overflowY: 'auto', flexGrow: 1 }}>
           {isLoadingFiles ? (
-            <div style={{ padding: '16px', color: '#6b7280', fontSize: '14px' }}>
-              Loading file list...
-            </div>
+            <div style={{ padding: '16px', color: '#6b7280', fontSize: '14px' }}>Loading file list...</div>
           ) : fileLoadError ? (
-            <div style={{ padding: '16px', color: '#dc2626', fontSize: '14px' }}>
-              {fileLoadError}
-            </div>
+            <div style={{ padding: '16px', color: '#dc2626', fontSize: '14px' }}>{fileLoadError}</div>
           ) : filteredGroups.length ? (
             filteredGroups.map((group) => (
               <div
@@ -3444,46 +3781,22 @@ export default function CSVViewer() {
                 }}
                 onClick={() => handleGroupSelect(group.id)}
               >
-                <FileText style={{
-                  width: '16px',
-                  height: '16px',
-                  marginRight: '8px',
-                  color: '#3b82f6'
-                }} />
-                <div style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  overflow: 'hidden'
-                }}>
+                <FileText style={{ width: '16px', height: '16px', marginRight: '8px', color: '#3b82f6' }} />
+                <div style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
                   <span style={{
                     fontSize: '14px',
                     fontWeight: selectedGroupId === group.id ? 600 : 500,
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis'
-                  }}>
-                    {group.displayName}
-                  </span>
+                    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+                  }}>{group.displayName}</span>
                   <span style={{
-                    fontSize: '12px',
-                    color: '#6b7280',
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis'
+                    fontSize: '12px', color: '#6b7280', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
                   }}>
                     {group.csvName}
                     {group.folder === provider_folder ? ' · Provider data' : ''}
                     {group.files.length > 1 ? ' · ' + group.files.length + ' files' : ''}
                   </span>
                   {normalizedSearch && (groupColumnMatches.get(group.id)?.length > 0) && (
-                    <span style={{
-                      fontSize: '12px',
-                      color: '#6b7280',
-                      whiteSpace: 'nowrap',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      marginTop: 2
-                    }}>
+                    <span style={{ fontSize: '12px', color: '#6b7280', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: 2 }}>
                       Columns: {(() => {
                         const cols = groupColumnMatches.get(group.id) || [];
                         const preview = cols.slice(0, 2).join(', ');
@@ -3496,8 +3809,56 @@ export default function CSVViewer() {
               </div>
             ))
           ) : (
-            <div style={{ padding: '16px', color: '#6b7280', fontSize: '14px' }}>
-              No files match your search.
+            <div style={{ padding: '16px', color: '#6b7280', fontSize: '14px' }}>No files match your search.</div>
+          )}
+
+          {/* Cross-tab matches */}
+          {normalizedSearch && (
+            <div style={{ marginTop: 12 }}>
+              <div style={{
+                fontSize: '12px', color: '#6b7280', padding: '4px 8px', borderTop: '1px solid #e5e7eb', marginTop: 8
+              }}>
+                Matches in other tabs
+              </div>
+              {crossTabLoading && (
+                <div style={{ padding: '8px 12px', color: '#6b7280', fontSize: 13 }}>Searching other tabs…</div>
+              )}
+              {crossTabError && (
+                <div style={{ padding: '8px 12px', color: '#dc2626', fontSize: 13 }}>{crossTabError}</div>
+              )}
+              {!crossTabLoading && !crossTabError && crossTabMatches.length === 0 && (
+                <div style={{ padding: '8px 12px', color: '#9ca3af', fontSize: 13 }}>No matches in other tabs.</div>
+              )}
+              {!crossTabLoading && !crossTabError && crossTabMatches.length > 0 && (
+                crossTabMatches.map(({ categoryId, categoryLabel, group }) => (
+                  <div
+                    key={`${categoryId}::${group.id}`}
+                    style={{
+                      display: 'flex', alignItems: 'center', padding: '8px', cursor: 'pointer',
+                      borderRadius: '6px', marginBottom: '2px', backgroundColor: 'transparent'
+                    }}
+                    onClick={() => handleCrossTabOpen(categoryId, group)}
+                  >
+                    <FileText style={{ width: 16, height: 16, marginRight: 8, color: '#6b7280' }} />
+                    <div style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden', flex: 1 }}>
+                      <span style={{ fontSize: 14, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {group.displayName}
+                      </span>
+                      <span style={{ fontSize: 12, color: '#6b7280', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {group.csvName}
+                        {group.folder === provider_folder ? ' · Provider data' : ''}
+                        {group.files.length > 1 ? ' · ' + group.files.length + ' files' : ''}
+                      </span>
+                    </div>
+                    <span style={{
+                      marginLeft: 8, fontSize: 11, color: '#1f2937', background: '#e5e7eb',
+                      border: '1px solid #d1d5db', padding: '2px 6px', borderRadius: 9999
+                    }}>
+                      {categoryLabel}
+                    </span>
+                  </div>
+                ))
+              )}
             </div>
           )}
         </div>
@@ -3513,7 +3874,7 @@ export default function CSVViewer() {
         flexDirection: 'column',
         height: 'calc(100vh - 80px)',
         marginTop: '96px',
-        overflow: 'hidden'
+        overflow: 'visible'
       }}>
         <div style={{
           padding: '16px',
@@ -3560,6 +3921,15 @@ export default function CSVViewer() {
                 )}
               </div>
             )}
+            {/* Native header toggle, when dbt specifies headers=true */}
+            {headersInFile && !isSqliteMode && (
+              <div style={{ marginTop: 4 }}>
+                <label style={{ fontSize: 12, color: '#6b7280', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <input type="checkbox" checked={showNativeHeader} onChange={(e) => setShowNativeHeader(e.target.checked)} />
+                  View native file header
+                </label>
+              </div>
+            )}
             {/* Simple in-app history viewer toggle */}
             {currentFileName && (
               <div style={{ marginTop: 8 }}>
@@ -3591,12 +3961,14 @@ export default function CSVViewer() {
                 }}>
                   Files included:
                 </span>
-                <div style={{
+                <div ref={segmentsWrapperRef} style={{
                   display: 'flex',
-                  flexWrap: 'wrap',
-                  gap: '8px'
+                  flexWrap: segmentsExpanded ? 'wrap' : 'nowrap',
+                  gap: '8px',
+                  overflowX: segmentsExpanded ? 'visible' : 'auto',
+                  minWidth: 0
                 }}>
-                  {selectedGroup.files.map((file) => (
+                  {(segmentsExpanded ? selectedGroup.files : selectedGroup.files.slice(0, collapseVisibleCount)).map((file) => (
                     <button
                       key={file}
                       type="button"
@@ -3616,6 +3988,25 @@ export default function CSVViewer() {
                       {file}
                     </button>
                   ))}
+                  {selectedGroup.files.length > collapseVisibleCount && (
+                    <button
+                      type="button"
+                      onClick={() => setSegmentsExpanded((v) => !v)}
+                      style={{
+                        border: '1px solid #d1d5db',
+                        backgroundColor: '#ffffff',
+                        color: '#111827',
+                        borderRadius: '9999px',
+                        padding: '4px 10px',
+                        fontSize: '12px',
+                        cursor: 'pointer',
+                        lineHeight: 1,
+                        whiteSpace: 'nowrap'
+                      }}
+                    >
+                      {segmentsExpanded ? 'Show less' : `Show all ${selectedGroup.files.length}`}
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -3875,12 +4266,17 @@ export default function CSVViewer() {
               
               <div style={{
                 overflowY: 'auto',
-                flexGrow: 1
+                overflowX: 'scroll',
+                scrollbarGutter: 'stable',
+                flexGrow: 1,
+                minWidth: 0
               }}>
                 <table style={{
+                  width: 'max-content',
                   minWidth: '100%',
                   borderCollapse: 'separate',
-                  borderSpacing: 0
+                  borderSpacing: 0,
+                  tableLayout: 'auto'
                 }}>
                   <thead style={{
                     position: 'sticky',
@@ -4181,22 +4577,31 @@ export default function CSVViewer() {
                           const label = (r.start && r.end && r.start !== r.end)
                             ? `${r.start} – ${r.end}`
                             : (r.start || r.end || (r.versions?.[0] ?? 'unknown'));
+                          const targetVersion = r.start || (Array.isArray(r.versions) ? r.versions.slice().sort((a, b) => compareVersionStrings(b, a))[0] : (r.end || null));
+                          const clickable = !!targetVersion;
                           return (
-                            <div key={r.key} style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'space-between',
-                              border: '1px solid #e5e7eb',
-                              background: contains ? '#eef2ff' : '#f9fafb',
-                              color: '#111827',
-                              borderRadius: 6,
-                              padding: '6px 10px'
-                            }}>
+                            <button
+                              key={r.key}
+                              type="button"
+                              onClick={() => { if (clickable) { handleVersionChange(targetVersion); setIsCrosswalkOpen(false); } }}
+                              disabled={!clickable}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                border: '1px solid #e5e7eb',
+                                background: contains ? '#eef2ff' : '#f9fafb',
+                                color: '#111827',
+                                borderRadius: 6,
+                                padding: '6px 10px',
+                                cursor: clickable ? 'pointer' : 'default'
+                              }}
+                            >
                               <div>{label}</div>
                               {r.signature && (
                                 <div style={{ color: '#6b7280', marginLeft: 8 }}>sig: {r.signature.slice(0, 12)}…</div>
                               )}
-                            </div>
+                            </button>
                           );
                         })}
                       </div>

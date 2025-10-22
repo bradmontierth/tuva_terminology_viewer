@@ -119,6 +119,26 @@ const listTags = () => {
     .filter(Boolean);
 };
 
+const resolveDefaultBranchRef = () => {
+  // Try to detect the remote HEAD branch (origin/main or origin/master)
+  try {
+    const res = runGit(['symbolic-ref', 'refs/remotes/origin/HEAD'], { allowError: true });
+    const ref = typeof res.stdout === 'string' ? res.stdout.trim() : (res.stdout ? res.stdout.toString().trim() : '');
+    if (res.status === 0 && ref) {
+      const parts = ref.split('/');
+      const branch = parts[parts.length - 1];
+      if (branch) return `origin/${branch}`;
+    }
+  } catch (_) {}
+  // Fallbacks
+  const candidates = ['origin/main', 'origin/master'];
+  for (const c of candidates) {
+    const check = runGit(['rev-parse', '--verify', c], { allowError: true });
+    if (check.status === 0) return c;
+  }
+  return null;
+};
+
 const normalize = (value) => (value || '').trim().toLowerCase();
 
 const parseHook = (hook) => {
@@ -142,7 +162,17 @@ const parseHook = (hook) => {
   }
 
   const fileName = csvMatches[csvMatches.length - 1][1];
-  return { folder, version, fileName };
+  // Detect headers flag (headers=true/false) in the macro call
+  let headersInFile = false;
+  try {
+    const m = hook.match(/\bheaders\s*=\s*(true|false)/i);
+    if (m && m[1]) {
+      headersInFile = String(m[1]).toLowerCase() === 'true';
+    }
+  } catch (_) {
+    // ignore parse issues
+  }
+  return { folder, version, fileName, headersInFile };
 };
 
 const collectSeedEntries = (node, pathParts = []) => {
@@ -238,20 +268,21 @@ const buildCrosswalk = (tags) => {
     repoDir,
     tagsProcessed: [],
     tagsWithErrors: [],
+    branchesProcessed: [],
     latestPerFolder: {},
     latestVersion: null,
   };
 
-  tags.forEach((tag) => {
+  const processRef = (ref, kind = 'tag') => {
     let yamlText;
     try {
-      const showResult = runGit(['show', `${tag}:dbt_project.yml`]);
+      const showResult = runGit(['show', `${ref}:dbt_project.yml`]);
       yamlText = typeof showResult.stdout === 'string'
         ? showResult.stdout
         : (showResult.stdout ? showResult.stdout.toString() : '');
     } catch (error) {
-      warn(`Skipping ${tag}: unable to load dbt_project.yml (${error.message})`);
-      meta.tagsWithErrors.push(tag);
+      warn(`Skipping ${ref}: unable to load dbt_project.yml (${error.message})`);
+      if (kind === 'tag') meta.tagsWithErrors.push(ref); else meta.tagsWithErrors.push({ branch: ref, error: error.message });
       return;
     }
 
@@ -259,22 +290,22 @@ const buildCrosswalk = (tags) => {
     try {
       projectConfig = yaml.load(yamlText) || {};
     } catch (error) {
-      warn(`Skipping ${tag}: invalid YAML (${error.message})`);
-      meta.tagsWithErrors.push(tag);
+      warn(`Skipping ${ref}: invalid YAML (${error.message})`);
+      if (kind === 'tag') meta.tagsWithErrors.push(ref); else meta.tagsWithErrors.push({ branch: ref, error: error.message });
       return;
     }
 
     const seedRoot = projectConfig.seeds || {};
     const entries = collectSeedEntries(seedRoot);
     if (!entries.length) {
-      log(`No load_seed hooks found in ${tag}`);
+      log(`No load_seed hooks found in ${ref}`);
       return;
     }
 
     const versionErrors = [];
 
     entries.forEach((entry) => {
-      const { folder, version, fileName, pathParts } = entry;
+      const { folder, version, fileName, pathParts, headersInFile } = entry;
       if (!folder || !version || !fileName) {
         return;
       }
@@ -285,10 +316,11 @@ const buildCrosswalk = (tags) => {
         return;
       }
 
-      const headers = readSeedHeaders(tag, seedRelativePath);
+      const headers = readSeedHeaders(ref, seedRelativePath);
+      // Even if we cannot read headers from the repo seed file, still record an entry so
+      // the viewer can rely on headersInFile=true and use the native S3 header row.
       if (!headers || !headers.length) {
         versionErrors.push(`${folder}/${version}:${fileName}`);
-        return;
       }
 
       const folderKey = normalize(folder);
@@ -305,18 +337,29 @@ const buildCrosswalk = (tags) => {
 
       if (!crosswalk[folderKey][versionKey][fileKey]) {
         crosswalk[folderKey][versionKey][fileKey] = {
-          headers,
+          headers: Array.isArray(headers) ? headers : [],
           seed: `seeds/${seedRelativePath}.csv`,
-          tag,
+          tag: ref,
+          headersInFile: !!headersInFile,
         };
       }
     });
 
-    meta.tagsProcessed.push(tag);
+    if (kind === 'tag') meta.tagsProcessed.push(ref); else meta.branchesProcessed.push(ref);
     if (versionErrors.length) {
-      meta.tagsWithErrors.push({ tag, entries: versionErrors });
+      if (kind === 'tag') meta.tagsWithErrors.push({ tag: ref, entries: versionErrors });
+      else meta.tagsWithErrors.push({ branch: ref, entries: versionErrors });
     }
-  });
+  };
+
+  // Process all tags
+  tags.forEach((tag) => processRef(tag, 'tag'));
+
+  // Also process default branch (e.g., origin/main) to capture unpublished versions
+  const defaultBranchRef = resolveDefaultBranchRef();
+  if (defaultBranchRef) {
+    processRef(defaultBranchRef, 'branch');
+  }
 
   // Compute latest per folder and global latest from discovered versions
   try {
