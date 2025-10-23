@@ -396,6 +396,8 @@ export default function CSVViewer() {
   const [categoryGroupsCache, setCategoryGroupsCache] = useState({});
   const categoryGroupsCacheRef = useRef({});
   useEffect(() => { categoryGroupsCacheRef.current = categoryGroupsCache; }, [categoryGroupsCache]);
+  // Deduplicate concurrent cross-tab listings per (category, versionKey)
+  const inflightCategoryGroupsRef = useRef(new Map());
   const [showNativeHeader, setShowNativeHeader] = useState(false);
   const segmentsWrapperRef = useRef(null);
   const [collapseVisibleCount, setCollapseVisibleCount] = useState(6);
@@ -2741,38 +2743,52 @@ export default function CSVViewer() {
       return existing.groups || [];
     }
 
+    // If a request for this (category, versionKey) is already in-flight, reuse it
+    const inflightKey = `${categoryId}::${versionKey}`;
+    const inflight = inflightCategoryGroupsRef.current.get(inflightKey);
+    if (inflight) {
+      return inflight;
+    }
+
     // Mark loading in cache
     setCategoryGroupsCache((prev) => ({
       ...prev,
       [categoryId]: { ...(prev[categoryId] || {}), loading: true, loaded: false, error: null, versionKey, groups: [] },
     }));
+    const loadPromise = (async () => {
+      try {
+        const fileLists = await Promise.all(
+          (category.sources || []).map((source) => {
+            if (source.type === 'versioned' && !terminologyVersion) {
+              return [];
+            }
+            return listFilesForSource(source).catch((_) => []);
+          })
+        );
 
+        const entries = (category.sources || []).flatMap((source, index) =>
+          (fileLists[index] || []).map((fileName) => ({ folder: source.folder, fileName }))
+        );
+        const groups = buildFileGroups(entries);
+
+        setCategoryGroupsCache((prev) => ({
+          ...prev,
+          [categoryId]: { loading: false, loaded: true, error: null, versionKey, groups },
+        }));
+        return groups;
+      } catch (err) {
+        setCategoryGroupsCache((prev) => ({
+          ...prev,
+          [categoryId]: { loading: false, loaded: true, error: err?.message || 'Failed to load', versionKey, groups: [] },
+        }));
+        return [];
+      }
+    })();
+    inflightCategoryGroupsRef.current.set(inflightKey, loadPromise);
     try {
-      const fileLists = await Promise.all(
-        (category.sources || []).map((source) => {
-          if (source.type === 'versioned' && !terminologyVersion) {
-            return [];
-          }
-          return listFilesForSource(source).catch((_) => []);
-        })
-      );
-
-      const entries = (category.sources || []).flatMap((source, index) =>
-        (fileLists[index] || []).map((fileName) => ({ folder: source.folder, fileName }))
-      );
-      const groups = buildFileGroups(entries);
-
-      setCategoryGroupsCache((prev) => ({
-        ...prev,
-        [categoryId]: { loading: false, loaded: true, error: null, versionKey, groups },
-      }));
-      return groups;
-    } catch (err) {
-      setCategoryGroupsCache((prev) => ({
-        ...prev,
-        [categoryId]: { loading: false, loaded: true, error: err?.message || 'Failed to load', versionKey, groups: [] },
-      }));
-      return [];
+      return await loadPromise;
+    } finally {
+      inflightCategoryGroupsRef.current.delete(inflightKey);
     }
   }, [buildFileGroups, getCategoryVersionKey, listFilesForSource, terminologyVersion]);
 
@@ -2849,13 +2865,14 @@ export default function CSVViewer() {
       }
       setCrossTabLoading(true);
       try {
-        // Ensure groups for other categories are available (load on-demand)
-        await Promise.all(otherCategories.map((cat) => loadGroupsForCategory(cat)));
+        // Ensure groups for other categories are available (load on-demand).
+        // Use the returned groups directly to avoid re-reading cache state and
+        // causing effect churn while cache flips between loading/loaded.
+        const loadedLists = await Promise.all(otherCategories.map((cat) => loadGroupsForCategory(cat)));
         if (cancelled) return;
 
-        const allOther = otherCategories.flatMap((cat) => {
-          const cache = categoryGroupsCache[cat.id];
-          const groups = cache && cache.groups ? cache.groups : [];
+        const allOther = otherCategories.flatMap((cat, idx) => {
+          const groups = Array.isArray(loadedLists[idx]) ? loadedLists[idx] : [];
           // Filter groups with same criteria as current tab
           const matches = groups.filter((group) => {
             const haystack = [group.displayName, group.csvName, ...(group.files || [])].join(' ').toLowerCase();
@@ -2881,7 +2898,7 @@ export default function CSVViewer() {
     };
     run();
     return () => { cancelled = true; };
-  }, [normalizedSearch, otherCategories, loadGroupsForCategory, categoryGroupsCache, resolveCrosswalkEntry, terminologyVersion]);
+  }, [normalizedSearch, otherCategories, loadGroupsForCategory, resolveCrosswalkEntry, terminologyVersion]);
 
   const handleCrossTabOpen = useCallback((categoryId, group) => {
     if (!categoryId || !group) return;
@@ -3507,7 +3524,8 @@ export default function CSVViewer() {
       width: '100%',
       padding: '16px',
       boxSizing: 'border-box',
-      overflow: 'hidden'
+      overflow: 'hidden',
+      gap: '16px'
     }}>
       <div style={{
         position: 'absolute',
@@ -3714,12 +3732,11 @@ export default function CSVViewer() {
 
       {/* Left sidebar with file list */}
       <div style={{
-        width: '25%',
+        flex: '0 0 25%',
         minWidth: '250px',
         backgroundColor: '#f9fafb',
         borderRadius: '8px',
         padding: '16px',
-        marginRight: '16px',
         display: 'flex',
         flexDirection: 'column',
         height: 'calc(100vh - 80px)',
@@ -3866,7 +3883,8 @@ export default function CSVViewer() {
 
       {/* Right side with file content */}
       <div style={{
-        width: '75%',
+        flex: '1 1 0',
+        minWidth: 0,
         backgroundColor: 'white',
         border: '1px solid #e5e7eb',
         borderRadius: '8px',

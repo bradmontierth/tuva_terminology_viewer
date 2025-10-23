@@ -67,10 +67,12 @@ function main() {
     const v = identity[f] && identity[f].versions;
     if (Array.isArray(v)) v.forEach((x) => { if (String(x).toLowerCase() !== 'latest') vers.add(String(x)); });
   });
+  // Sort all known versions in descending order
   const ordered = Array.from(vers).sort((a, b) => compareVersions(b, a));
+  // Choose the nearest version strictly less than the latest published
   let prev = null;
   for (const v of ordered) {
-    if (v !== latest) { prev = v; break; }
+    if (compareVersions(v, latest) < 0) { prev = v; break; }
   }
   if (!prev && ordered.length > 0) prev = ordered[0];
   if (!prev) {
@@ -105,4 +107,3 @@ function main() {
 }
 
 main();
-
